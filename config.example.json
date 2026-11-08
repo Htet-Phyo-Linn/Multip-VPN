@@ -1,0 +1,20 @@
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Example-Node-1",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/path"
+      },
+      "packet_encoding": "xudp"
+    }
+  ]
+}

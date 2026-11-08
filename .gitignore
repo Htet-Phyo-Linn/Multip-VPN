@@ -1,0 +1,28 @@
+# Binaries
+sing-box.exe
+
+# Private credentials & Keys
+key.txt
+*.key
+*.pem
+*.crt
+
+# VPN Configurations (contains private keys/uuids)
+config*.json
+!config.example.json
+
+# Runtime dynamic files & cache
+_singbox*.json
+_geo_cache.json
+_probe*.json
+*.tmp
+*.log
+
+# Safety backups
+backups/
+
+# System / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
