@@ -319,15 +319,16 @@ foreach ($file in $configFiles) {
             continue
         }
 
-        # Deduplicate strictly by resolved IP + Port combination
-        $ipPortKey = "$resolvedIp`:$port"
-        if ($seenIpPorts.ContainsKey($ipPortKey)) {
-            Write-Host ("  [{0}/{1}] {2,-10} {3}:{4} ({5}) -> DUPLICATE IP:PORT (Already in {6})" -f $nodeIdx, $nodeCount, $type, $server, $port, $resolvedIp, $seenIpPorts[$ipPortKey]) -ForegroundColor DarkGray
+        # Deduplicate strictly by Type + resolved IP + Port combination
+        # (Prevents dropping Hysteria2 UDP vs VLESS TCP on the same port 443)
+        $typeIpPortKey = "$($type)://$resolvedIp`:$port".ToLowerInvariant()
+        if ($seenIpPorts.ContainsKey($typeIpPortKey)) {
+            Write-Host ("  [{0}/{1}] {2,-10} {3}:{4} ({5}) -> DUPLICATE PROTOCOL+IP:PORT (Already in {6})" -f $nodeIdx, $nodeCount, $type, $server, $port, $resolvedIp, $seenIpPorts[$typeIpPortKey]) -ForegroundColor DarkGray
             $fileDupCount++
             $totalDuplicateNodes++
             continue
         }
-        $seenIpPorts[$ipPortKey] = $file.Name
+        $seenIpPorts[$typeIpPortKey] = $file.Name
 
         # 2. Geo Location check
         $geo = Get-NodeGeoInfo $resolvedIp

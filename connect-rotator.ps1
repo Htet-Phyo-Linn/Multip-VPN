@@ -396,7 +396,7 @@ Write-Info "Querying geolocations for $($targetIPs.Count) IP(s) in parallel (bat
 $geoResults = Resolve-GeoLocationsParallel -IPs $targetIPs
 Save-GeoCache
 
-# Filter nodes and tag with country/city (Deduplicated by IP + Port combination)
+# Filter nodes and tag with country/city (Deduplicated by Type + IP + Port combination)
 $seenIpPortCombo      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $duplicateServerCount = 0
 
@@ -405,9 +405,9 @@ foreach ($node in $rawNodes) {
     if (-not $resolvedServerIPs.ContainsKey($serverStr)) { continue }
 
     $resolvedIP = $resolvedServerIPs[$serverStr]
-    $ipPortKey = "$resolvedIP`:$($node.server_port)"
+    $typeIpPortKey = "$($node.type)://$resolvedIP`:$($node.server_port)".ToLowerInvariant()
 
-    if ($seenIpPortCombo.Contains($ipPortKey)) {
+    if ($seenIpPortCombo.Contains($typeIpPortKey)) {
         $duplicateServerCount++
         continue
     }
@@ -418,7 +418,7 @@ foreach ($node in $rawNodes) {
 
     if ($country -in $BlockedCountries) { continue }
 
-    $null = $seenIpPortCombo.Add($ipPortKey)
+    $null = $seenIpPortCombo.Add($typeIpPortKey)
     $null = $allowedServerIPs.Add($resolvedIP)
 
     # Store clean country label on node for display
@@ -428,7 +428,7 @@ foreach ($node in $rawNodes) {
 }
 
 if ($duplicateServerCount -gt 0) {
-    Write-Info "Deduplication: Filtered out $duplicateServerCount duplicate node(s) sharing identical IP:Port combination."
+    Write-Info "Deduplication: Filtered out $duplicateServerCount duplicate node(s) sharing identical Protocol + IP:Port."
 }
 
 if ($approvedNodes.Count -eq 0) {

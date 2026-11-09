@@ -595,10 +595,11 @@ foreach ($line in $keyLines) {
         }
         $seenSignatures[$sig] = $true
 
-        # Deduplicate by server + port combination
-        $srvPortKey = ("{0}:{1}" -f $node.server, $node.server_port).ToLowerInvariant()
+        # Deduplicate by protocol type + server + port combination
+        # (Allows Hysteria2 UDP and VLESS TCP on the same server:port)
+        $srvPortKey = ("{0}://{1}:{2}" -f $node.type, $node.server, $node.server_port).ToLowerInvariant()
         if ($seenServerPorts.ContainsKey($srvPortKey)) {
-            Write-Host ("  [!] Node {0}: Skipped duplicate server endpoint ({1}:{2})" -f $lineNum, $node.server, $node.server_port) -ForegroundColor DarkGray
+            Write-Host ("  [!] Node {0}: Skipped duplicate protocol endpoint ({1}://{2}:{3})" -f $lineNum, $node.type, $node.server, $node.server_port) -ForegroundColor DarkGray
             continue
         }
         $seenServerPorts[$srvPortKey] = $true

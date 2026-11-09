@@ -509,7 +509,7 @@ foreach ($srv in $uniqueServers) {
     }
 }
 
-# 5. Filter nodes: Deduplicate strictly by IP + Port combination and keep only country-approved nodes
+# 5. Filter nodes: Deduplicate strictly by Type + IP + Port combination and keep only country-approved nodes
 $approvedNodes        = [System.Collections.Generic.List[object]]::new()
 $seenIpPortCombo      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $duplicateServerCount = 0
@@ -520,24 +520,25 @@ foreach ($node in $rawClusterNodes) {
         continue
     }
 
-    # Resolve target IP
+    # Resolve target IP and enforce Protocol Type + IP + Port uniqueness
+    # (Prevents dropping Hysteria2 UDP vs VLESS TCP on the same port 443)
     $targetIp = if ($resolvedServerIPs.ContainsKey($srv)) { $resolvedServerIPs[$srv] } else { $srv }
-    $ipPortKey = "$targetIp`:$($node.server_port)"
+    $typeIpPortKey = "$($node.type)://$targetIp`:$($node.server_port)".ToLowerInvariant()
 
-    if ($seenIpPortCombo.Contains($ipPortKey)) {
+    if ($seenIpPortCombo.Contains($typeIpPortKey)) {
         $duplicateServerCount++
         continue
     }
-    $null = $seenIpPortCombo.Add($ipPortKey)
+    $null = $seenIpPortCombo.Add($typeIpPortKey)
     $approvedNodes.Add($node)
 }
 
 $droppedCount = $rawClusterNodes.Count - $approvedNodes.Count
 Write-Host ""
 if ($duplicateServerCount -gt 0) {
-    Write-Info "Deduplication: Filtered out $duplicateServerCount duplicate node(s) sharing identical IP:Port combination."
+    Write-Info "Deduplication: Filtered out $duplicateServerCount duplicate node(s) sharing identical Protocol + IP:Port."
 }
-Write-Ok "Cluster Pool: $($approvedNodes.Count) nodes passed security, region & IP:Port filter ($droppedCount dropped)."
+Write-Ok "Cluster Pool: $($approvedNodes.Count) nodes passed security, region & Protocol+IP:Port filter ($droppedCount dropped)."
 $protoSummary = ($approvedNodes | Group-Object type | ForEach-Object { "$($_.Name.ToUpper()): $($_.Count)" }) -join " | "
 Write-Host "   Approved Protocols: $protoSummary" -ForegroundColor Yellow
 Write-Host ""
