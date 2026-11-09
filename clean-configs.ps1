@@ -25,7 +25,9 @@
 param(
     [switch]$DryRun,
     [string]$TargetFile,
-    [switch]$KeepSplit
+    [switch]$KeepSplit,
+    [int]$Threads = 16,
+    [int]$TimeoutMs = 9000
 )
 
 # Set UTF-8 Console
@@ -260,7 +262,10 @@ foreach ($file in $configFiles) {
     $fileBlockedCount   = 0
     $fileDupCount       = 0
 
+    # Step 1: Fast Filter (Duplicates, DNS & Geo-Policy)
+    $candidateList = [System.Collections.Generic.List[PSObject]]::new()
     $nodeIdx = 0
+
     foreach ($node in $proxyNodes) {
         $nodeIdx++
         $type   = $node.type
@@ -305,18 +310,120 @@ foreach ($file in $configFiles) {
             continue
         }
 
-        # 3. Connectivity check (sing-box fetch)
-        $testResult = Test-SingBoxNodeConnectivity $node
-        if ($testResult.Alive) {
-            Write-Host ("  [{0}/{1}] {2,-10} {3}:{4} -> ALIVE [{5} - {6}] ({7}ms)" -f $nodeIdx, $nodeCount, $type, $server, $port, $country, $city, $testResult.LatencyMs) -ForegroundColor Green
-            $fileSurvivingNodes += $node
-            $allSurvivingNodes  += $node
-            $seenSignatures[$sig] = $file.Name
-        } else {
-            $reason = if ($testResult.Error) { $testResult.Error } else { "Failed" }
-            Write-Host ("  [{0}/{1}] {2,-10} {3}:{4} -> DEAD ({5})" -f $nodeIdx, $nodeCount, $type, $server, $port, $reason) -ForegroundColor Red
-            $fileDeadCount++
-            $totalDeadPurged++
+        # Passes pre-filter -> queue for multi-threaded live probe
+        $candidateList.Add([PSObject]@{
+            Node    = $node
+            Sig     = $sig
+            Country = $country
+            City    = $city
+            ItemNum = $nodeIdx
+        })
+    }
+
+    # Step 2: Multi-Threaded Connectivity Probe (16 threads, 9s delay/timeout)
+    if ($candidateList.Count -gt 0) {
+        if ($Threads -lt 1) { $Threads = 16 }
+        if ($TimeoutMs -lt 1000) { $TimeoutMs = 9000 }
+        Write-Host ("    Probing {0} candidate node(s) with {1} parallel thread(s) (Timeout: {2}ms)..." -f $candidateList.Count, $Threads, $TimeoutMs) -ForegroundColor Cyan
+
+        $activeJobs = [System.Collections.Generic.List[PSObject]]::new()
+        $candIdx = 0
+        $totalCandidates = $candidateList.Count
+
+        while ($candIdx -lt $totalCandidates -or $activeJobs.Count -gt 0) {
+            # Dispatch workers up to $Threads
+            while ($candIdx -lt $totalCandidates -and $activeJobs.Count -lt $Threads) {
+                $cItem = $candidateList[$candIdx]
+                $candIdx++
+
+                $probeTmpPath = Join-Path $env:TEMP ("singbox_probe_" + [Guid]::NewGuid().ToString("N") + ".json")
+                $cloneJson = $cItem.Node | ConvertTo-Json -Depth 10
+                $nodeClone = $cloneJson | ConvertFrom-Json
+                $nodeClone.tag = "probe-target"
+
+                $probeConfig = @{
+                    log = @{ level = "error" }
+                    outbounds = @($nodeClone)
+                }
+                $jsonStr = $probeConfig | ConvertTo-Json -Depth 10
+                [System.IO.File]::WriteAllText($probeTmpPath, $jsonStr, $utf8NoBom)
+
+                $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pinfo.FileName = $SingBoxBin
+                $pinfo.Arguments = "tools fetch https://www.gstatic.com/generate_204 -c `"$probeTmpPath`" -o probe-target"
+                $pinfo.RedirectStandardOutput = $true
+                $pinfo.RedirectStandardError = $true
+                $pinfo.UseShellExecute = $false
+                $pinfo.CreateNoWindow = $true
+
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $proc = [System.Diagnostics.Process]::Start($pinfo)
+
+                $activeJobs.Add([PSObject]@{
+                    Process   = $proc
+                    Stopwatch = $sw
+                    TmpFile   = $probeTmpPath
+                    Candidate = $cItem
+                })
+                Start-Sleep -Milliseconds 25
+            }
+
+            # Check running workers
+            if ($activeJobs.Count -gt 0) {
+                $stillRunning = [System.Collections.Generic.List[PSObject]]::new()
+                foreach ($job in $activeJobs) {
+                    $p = $job.Process
+                    $sw = $job.Stopwatch
+                    $elapsed = $sw.ElapsedMilliseconds
+                    $cItem = $job.Candidate
+                    $node = $cItem.Node
+
+                    if ($p.HasExited) {
+                        $sw.Stop()
+                        $exitCode = $p.ExitCode
+                        $errText = ""
+                        try { $errText = ($p.StandardError.ReadToEnd() -split "`n")[0].Trim() } catch {}
+                        $p.Dispose()
+                        Remove-Item $job.TmpFile -Force -ErrorAction SilentlyContinue
+
+                        if ($exitCode -eq 0) {
+                            Write-Host ("  [{0}/{1}] {2,-10} {3}:{4} -> ALIVE [{5} - {6}] ({7}ms)" -f $cItem.ItemNum, $nodeCount, $node.type, $node.server, $node.server_port, $cItem.Country, $cItem.City, $elapsed) -ForegroundColor Green
+                            $fileSurvivingNodes += $node
+                            $allSurvivingNodes  += $node
+                            $seenSignatures[$cItem.Sig] = $file.Name
+                        } else {
+                            $err = $errText
+                            if ($err -match "status code: (\d+)") {
+                                $err = "Auth error (HTTP $($Matches[1]))"
+                            } elseif ($err -match "EOF") {
+                                $err = "Server dropped connection (EOF)"
+                            } elseif ($err -match "refused") {
+                                $err = "Connection refused"
+                            } elseif ($err -match "reality verification failed") {
+                                $err = "Reality handshake failed"
+                            } elseif ($err -match "cannot validate certificate") {
+                                $err = "TLS certificate mismatch"
+                            }
+                            if (-not $err) { $err = "Failed" }
+                            Write-Host ("  [{0}/{1}] {2,-10} {3}:{4} -> DEAD ({5})" -f $cItem.ItemNum, $nodeCount, $node.type, $node.server, $node.server_port, $err) -ForegroundColor Red
+                            $fileDeadCount++
+                            $totalDeadPurged++
+                        }
+                    } elseif ($elapsed -gt $TimeoutMs) {
+                        $sw.Stop()
+                        try { $p.Kill(); $p.Dispose() } catch {}
+                        Remove-Item $job.TmpFile -Force -ErrorAction SilentlyContinue
+
+                        Write-Host ("  [{0}/{1}] {2,-10} {3}:{4} -> DEAD (Timeout >$($TimeoutMs)ms)" -f $cItem.ItemNum, $nodeCount, $node.type, $node.server, $node.server_port) -ForegroundColor Red
+                        $fileDeadCount++
+                        $totalDeadPurged++
+                    } else {
+                        $stillRunning.Add($job)
+                    }
+                }
+                $activeJobs = $stillRunning
+                Start-Sleep -Milliseconds 25
+            }
         }
     }
 
