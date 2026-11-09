@@ -550,6 +550,7 @@ if ($keyLines.Count -eq 0) {
 $parsedOutbounds = @()
 $tagCounts = @{}
 $seenSignatures = @{}
+$seenServerPorts = @{}
 
 $lineNum = 0
 foreach ($line in $keyLines) {
@@ -593,6 +594,14 @@ foreach ($line in $keyLines) {
             continue
         }
         $seenSignatures[$sig] = $true
+
+        # Deduplicate by server + port combination
+        $srvPortKey = ("{0}:{1}" -f $node.server, $node.server_port).ToLowerInvariant()
+        if ($seenServerPorts.ContainsKey($srvPortKey)) {
+            Write-Host ("  [!] Node {0}: Skipped duplicate server endpoint ({1}:{2})" -f $lineNum, $node.server, $node.server_port) -ForegroundColor DarkGray
+            continue
+        }
+        $seenServerPorts[$srvPortKey] = $true
 
         # Ensure unique tag
         $cleanTag = $node.tag

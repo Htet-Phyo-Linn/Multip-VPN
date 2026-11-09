@@ -244,6 +244,7 @@ $totalBlockedPurged  = 0
 $totalDuplicateNodes = 0
 $allSurvivingNodes   = @()
 $seenSignatures      = @{}
+$seenIpPorts         = @{}
 
 # Inspect and test each file
 foreach ($file in $configFiles) {
@@ -318,6 +319,16 @@ foreach ($file in $configFiles) {
             continue
         }
 
+        # Deduplicate strictly by resolved IP + Port combination
+        $ipPortKey = "$resolvedIp`:$port"
+        if ($seenIpPorts.ContainsKey($ipPortKey)) {
+            Write-Host ("  [{0}/{1}] {2,-10} {3}:{4} ({5}) -> DUPLICATE IP:PORT (Already in {6})" -f $nodeIdx, $nodeCount, $type, $server, $port, $resolvedIp, $seenIpPorts[$ipPortKey]) -ForegroundColor DarkGray
+            $fileDupCount++
+            $totalDuplicateNodes++
+            continue
+        }
+        $seenIpPorts[$ipPortKey] = $file.Name
+
         # 2. Geo Location check
         $geo = Get-NodeGeoInfo $resolvedIp
         $country = $geo.country
@@ -334,6 +345,7 @@ foreach ($file in $configFiles) {
         $candidateList.Add([PSObject]@{
             Node    = $node
             Sig     = $sig
+            IpPort  = $ipPortKey
             Country = $country
             City    = $city
             ItemNum = $nodeIdx

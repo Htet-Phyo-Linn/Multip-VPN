@@ -396,24 +396,39 @@ Write-Info "Querying geolocations for $($targetIPs.Count) IP(s) in parallel (bat
 $geoResults = Resolve-GeoLocationsParallel -IPs $targetIPs
 Save-GeoCache
 
-# Filter nodes and tag with country/city
+# Filter nodes and tag with country/city (Deduplicated by IP + Port combination)
+$seenIpPortCombo      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$duplicateServerCount = 0
+
 foreach ($node in $rawNodes) {
     $serverStr = $node.server.ToString().Trim()
     if (-not $resolvedServerIPs.ContainsKey($serverStr)) { continue }
 
     $resolvedIP = $resolvedServerIPs[$serverStr]
+    $ipPortKey = "$resolvedIP`:$($node.server_port)"
+
+    if ($seenIpPortCombo.Contains($ipPortKey)) {
+        $duplicateServerCount++
+        continue
+    }
+
     $geo = if ($geoResults.ContainsKey($resolvedIP)) { $geoResults[$resolvedIP] } else { $null }
     $country = if ($geo -and $geo.country) { $geo.country } else { "UNKNOWN" }
     $city    = if ($geo -and $geo.city) { $geo.city } else { "Unknown" }
 
     if ($country -in $BlockedCountries) { continue }
 
+    $null = $seenIpPortCombo.Add($ipPortKey)
     $null = $allowedServerIPs.Add($resolvedIP)
 
     # Store clean country label on node for display
     $node | Add-Member -MemberType NoteProperty -Name "_Country" -Value $country -Force
     $node | Add-Member -MemberType NoteProperty -Name "_City" -Value $city -Force
     $approvedNodes.Add($node)
+}
+
+if ($duplicateServerCount -gt 0) {
+    Write-Info "Deduplication: Filtered out $duplicateServerCount duplicate node(s) sharing identical IP:Port combination."
 }
 
 if ($approvedNodes.Count -eq 0) {

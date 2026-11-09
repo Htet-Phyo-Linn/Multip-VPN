@@ -509,18 +509,35 @@ foreach ($srv in $uniqueServers) {
     }
 }
 
-# 5. Filter nodes: Keep only nodes whose server passed the country blocklist
-$approvedNodes = [System.Collections.Generic.List[object]]::new()
+# 5. Filter nodes: Deduplicate strictly by IP + Port combination and keep only country-approved nodes
+$approvedNodes        = [System.Collections.Generic.List[object]]::new()
+$seenIpPortCombo      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$duplicateServerCount = 0
+
 foreach ($node in $rawClusterNodes) {
     $srv = $node.server.ToString().Trim()
-    if ($serverStatusMap.ContainsKey($srv) -and $serverStatusMap[$srv] -eq $true) {
-        $approvedNodes.Add($node)
+    if (-not ($serverStatusMap.ContainsKey($srv) -and $serverStatusMap[$srv] -eq $true)) {
+        continue
     }
+
+    # Resolve target IP
+    $targetIp = if ($resolvedServerIPs.ContainsKey($srv)) { $resolvedServerIPs[$srv] } else { $srv }
+    $ipPortKey = "$targetIp`:$($node.server_port)"
+
+    if ($seenIpPortCombo.Contains($ipPortKey)) {
+        $duplicateServerCount++
+        continue
+    }
+    $null = $seenIpPortCombo.Add($ipPortKey)
+    $approvedNodes.Add($node)
 }
 
 $droppedCount = $rawClusterNodes.Count - $approvedNodes.Count
 Write-Host ""
-Write-Ok "Cluster Pool: $($approvedNodes.Count) nodes passed security & region filter ($droppedCount dropped)."
+if ($duplicateServerCount -gt 0) {
+    Write-Info "Deduplication: Filtered out $duplicateServerCount duplicate node(s) sharing identical IP:Port combination."
+}
+Write-Ok "Cluster Pool: $($approvedNodes.Count) nodes passed security, region & IP:Port filter ($droppedCount dropped)."
 $protoSummary = ($approvedNodes | Group-Object type | ForEach-Object { "$($_.Name.ToUpper()): $($_.Count)" }) -join " | "
 Write-Host "   Approved Protocols: $protoSummary" -ForegroundColor Yellow
 Write-Host ""
