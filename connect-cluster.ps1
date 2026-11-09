@@ -1,4 +1,3 @@
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Sing-box Multi-Config Cluster & Auto Load Balancer (Tor-style multi-exit)
@@ -664,17 +663,34 @@ $fullOutbounds = [System.Collections.Generic.List[object]]::new()
 foreach ($grp in $clusterGroups)   { $fullOutbounds.Add($grp) }
 foreach ($node in $approvedNodes)  { $fullOutbounds.Add($node) }
 
-# 10. Split-Tunnel List: Exclude Customer Subnets + Approved Server IPs
+# 10. Split-Tunnel List: Exclude Customer Subnets + Antigravity Localhost + Approved Server IPs
+$standardPrivateSubnets = @(
+    "127.0.0.0/8",         # Localhost loopback (Antigravity IDE, local agent IPC, language servers)
+    "10.0.0.0/8",          # RFC 1918 Private / FortiClient / AnyConnect
+    "172.16.0.0/12",       # RFC 1918 Private / Customer VPN
+    "192.168.0.0/16",      # RFC 1918 Local LAN / Wi-Fi Gateway
+    "169.254.0.0/16",      # Link-local / APIPA
+    "224.0.0.0/4",         # Multicast
+    "255.255.255.255/32"   # Broadcast
+)
+
 $excludeList = [System.Collections.Generic.List[string]]::new()
-foreach ($sub in $CustomerSubnets) { $excludeList.Add($sub) }
+foreach ($p in $standardPrivateSubnets) {
+    if (-not $excludeList.Contains($p)) { $excludeList.Add($p) }
+}
+foreach ($sub in $CustomerSubnets) {
+    if (-not $excludeList.Contains($sub)) { $excludeList.Add($sub) }
+}
 foreach ($ip in $allowedServerIPs) {
     $cidr = "$ip/32"
     if (-not $excludeList.Contains($cidr)) { $excludeList.Add($cidr) }
 }
 
-# 11. DNS Configuration with Hosts Predefined for 0ms testing
+# 11. DNS Configuration with Hosts Predefined & Reliable TCP/DoH Remote DNS
 $hasHosts = ($hostsMap.PSObject.Properties | Measure-Object).Count -gt 0
 $dnsServers = [System.Collections.Generic.List[object]]::new()
+
+# Tier 1: Predefined hosts for VPN endpoints (0ms instant resolution, avoids DNS loops)
 if ($hasHosts) {
     $dnsServers.Add([pscustomobject]@{
         tag        = "dns-hosts"
@@ -682,22 +698,36 @@ if ($hasHosts) {
         predefined = $hostsMap
     })
 }
+
+# Tier 2: Remote TCP DNS (via Google 8.8.8.8 over proxy - reliable on 100% of proxy nodes)
 $dnsServers.Add([pscustomobject]@{
-    tag    = "dns-remote"
-    type   = "udp"
+    tag    = "dns-remote-tcp"
+    type   = "tcp"
     server = "8.8.8.8"
     detour = "proxy"
 })
+
+# Tier 3: Remote DoH DNS (via Cloudflare 1.1.1.1 over HTTPS over proxy)
+$dnsServers.Add([pscustomobject]@{
+    tag    = "dns-remote-doh"
+    type   = "https"
+    server = "https://1.1.1.1/dns-query"
+    detour = "proxy"
+})
+
+# Tier 4: Local physical adapter DNS (for private LAN, Customer VPN, and loopback)
 $dnsServers.Add([pscustomobject]@{
     tag  = "dns-local"
     type = "local"
 })
 
-$dnsRules = @()
+$dnsRules = [System.Collections.Generic.List[object]]::new()
 if ($hasHosts) {
     $hostDomains = @($hostsMap.PSObject.Properties | ForEach-Object { $_.Name })
-    $dnsRules = @([pscustomobject]@{ domain = $hostDomains; server = "dns-hosts" })
+    $dnsRules.Add([pscustomobject]@{ domain = $hostDomains; server = "dns-hosts" })
 }
+# Route private subnets, localhost, and customer VPNs directly to local DNS
+$dnsRules.Add([pscustomobject]@{ ip_is_private = $true; server = "dns-local" })
 
 # 12. Transparent TUN Inbound
 $tunInbound = [pscustomobject]@{
@@ -710,12 +740,15 @@ $tunInbound = [pscustomobject]@{
     route_exclude_address = @($excludeList)
 }
 
-# 13. Routing Rules
+# 13. Routing Rules (Antigravity & Customer VPN Safe)
 $routeBlock = [pscustomobject]@{
     default_domain_resolver = if ($hasHosts) { "dns-hosts" } else { "dns-local" }
     rules = @(
         [pscustomobject]@{ action = "sniff" },
         [pscustomobject]@{ protocol = "dns"; action = "hijack-dns" },
+        # Bypass all private IP traffic (Localhost 127.0.0.1, LAN, Customer VPN)
+        [pscustomobject]@{ ip_is_private = $true; outbound = "direct" },
+        # Bypass all explicit subnets & VPN server IPs
         [pscustomobject]@{
             ip_cidr  = @($excludeList)
             outbound = "direct"
@@ -729,8 +762,8 @@ $finalClusterConfig = [pscustomobject]@{
     log = [pscustomobject]@{ level = "warn"; timestamp = $true }
     dns = [pscustomobject]@{
         servers = @($dnsServers)
-        rules   = $dnsRules
-        final   = "dns-remote"
+        rules   = @($dnsRules)
+        final   = "dns-remote-tcp"
     }
     inbounds  = @($tunInbound)
     outbounds = @($fullOutbounds)

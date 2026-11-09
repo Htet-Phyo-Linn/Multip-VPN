@@ -1,4 +1,3 @@
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Multip VPN - Deep Network Clean & Factory Restoration Tool
@@ -184,11 +183,17 @@ $clearedRoutes = 0
 if ($routesToPurge.Count -gt 0) {
     Write-Host "  Purging $($routesToPurge.Count) lingering bypass route(s)..." -ForegroundColor Yellow
     foreach ($rt in $routesToPurge) {
+        $dest = $rt.DestinationPrefix.TrimEnd('/32')
         try {
-            Remove-NetRoute -DestinationPrefix $rt.DestinationPrefix -NextHop $rt.NextHop `
-                            -InterfaceIndex $rt.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
+            & route.exe delete $dest 2>$null | Out-Null
             $clearedRoutes++
-        } catch {}
+        } catch {
+            try {
+                Remove-NetRoute -DestinationPrefix $rt.DestinationPrefix -NextHop $rt.NextHop `
+                                -InterfaceIndex $rt.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
+                $clearedRoutes++
+            } catch {}
+        }
     }
     Write-Ok "Cleaned $clearedRoutes static bypass route(s)."
 } else {
@@ -319,19 +324,27 @@ if (-not $internetOk) {
 
 $sw.Stop()
 
+$procStatus  = if ($killedCount -gt 0) { "Terminated ($killedCount)" } else { "Clean (0 running)" }
+$routeStatus = if ($clearedRoutes -gt 0) { "Purged ($clearedRoutes orphan routes)" } else { "Clean (0 lingering)" }
+$fwStatus    = if ($clearedFw -gt 0) { "Cleared ($clearedFw rules)" } else { "Clean" }
+$gwStatus    = if ($gwReachable) { "CONNECTED ($($gw.Gateway) on $($gw.Name))" } else { "Active ($($gw.Gateway))" }
+$gwColor     = if ($gwReachable) { "Green" } else { "Yellow" }
+$netStatus   = if ($internetOk) { "ONLINE & VERIFIED" } else { "Connecting..." }
+$netColor    = if ($internetOk) { "Green" } else { "Yellow" }
+
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Green
 Write-Host "   NETWORK RESTORATION COMPLETE (Took $($sw.ElapsedMilliseconds) ms)" -ForegroundColor Green
 Write-Host "================================================================" -ForegroundColor Green
 Write-Host ""
-Write-Host ("  * Sing-Box Processes : " + (if ($killedCount -gt 0) { "Terminated ($killedCount)" } else { "Clean (0 running)" })) -ForegroundColor White
-Write-Host ("  * Static Host Routes : " + (if ($clearedRoutes -gt 0) { "Purged ($clearedRoutes orphan routes)" } else { "Clean (0 lingering)" })) -ForegroundColor White
-Write-Host ("  * Firewall Rules     : " + (if ($clearedFw -gt 0) { "Cleared ($clearedFw rules)" } else { "Clean" })) -ForegroundColor White
-Write-Host ("  * Windows Proxy      : Disabled (Direct Connection)" ) -ForegroundColor White
-Write-Host ("  * DNS & ARP Cache    : Flushed & Cleared" ) -ForegroundColor White
-Write-Host ("  * Physical Gateway   : " + (if ($gwReachable) { "CONNECTED ($($gw.Gateway) on $($gw.Name))" } else { "Active ($($gw.Gateway))" })) -ForegroundColor $(if ($gwReachable) { "Green" } else { "Yellow" })
-Write-Host ("  * Direct Internet    : " + (if ($internetOk) { "ONLINE & VERIFIED" } else { "Connecting..." })) -ForegroundColor $(if ($internetOk) { "Green" } else { "Yellow" })
-Write-Host ("  * Customer VPN       : INTACT (FortiClient / AnyConnect subnets preserved)" ) -ForegroundColor Green
+Write-Host "  * Sing-Box Processes : $procStatus" -ForegroundColor White
+Write-Host "  * Static Host Routes : $routeStatus" -ForegroundColor White
+Write-Host "  * Firewall Rules     : $fwStatus" -ForegroundColor White
+Write-Host "  * Windows Proxy      : Disabled (Direct Connection)" -ForegroundColor White
+Write-Host "  * DNS & ARP Cache    : Flushed & Cleared" -ForegroundColor White
+Write-Host "  * Physical Gateway   : $gwStatus" -ForegroundColor $gwColor
+Write-Host "  * Direct Internet    : $netStatus" -ForegroundColor $netColor
+Write-Host "  * Customer VPN       : INTACT (FortiClient / AnyConnect subnets preserved)" -ForegroundColor Green
 Write-Host ""
 Write-Host "[+] Your network is 100% clean and restored, exactly like after a reboot!" -ForegroundColor Cyan
 Write-Host ""

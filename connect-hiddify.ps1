@@ -1,4 +1,3 @@
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Universal Hiddify/sing-box Connect Script with Automatic Split-Tunneling

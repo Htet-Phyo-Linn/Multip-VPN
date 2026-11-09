@@ -528,9 +528,24 @@ foreach ($rn in $rotatingPool) { $fullOutbounds.Add($rn) }
 $fullOutbounds.Add([pscustomobject]@{ type = "direct"; tag = "direct" })
 $fullOutbounds.Add([pscustomobject]@{ type = "block";  tag = "block" })
 
-# Split-tunnel exclusions
+# Split-tunnel exclusions (Customer VPN + Antigravity Localhost Safe)
+$standardPrivateSubnets = @(
+    "127.0.0.0/8",         # Localhost loopback (Antigravity IDE, local agent IPC, language servers)
+    "10.0.0.0/8",          # RFC 1918 Private / FortiClient / AnyConnect
+    "172.16.0.0/12",       # RFC 1918 Private / Customer VPN
+    "192.168.0.0/16",      # RFC 1918 Local LAN / Wi-Fi Gateway
+    "169.254.0.0/16",      # Link-local / APIPA
+    "224.0.0.0/4",         # Multicast
+    "255.255.255.255/32"   # Broadcast
+)
+
 $excludeList = [System.Collections.Generic.List[string]]::new()
-foreach ($sub in $CustomerSubnets)  { $excludeList.Add($sub) }
+foreach ($p in $standardPrivateSubnets) {
+    if (-not $excludeList.Contains($p)) { $excludeList.Add($p) }
+}
+foreach ($sub in $CustomerSubnets) {
+    if (-not $excludeList.Contains($sub)) { $excludeList.Add($sub) }
+}
 foreach ($ip in $allowedServerIPs) {
     $cidr = "$ip/32"
     if (-not $excludeList.Contains($cidr)) { $excludeList.Add($cidr) }
@@ -554,10 +569,11 @@ $mixedInbound = [pscustomobject]@{
     listen_port = $MixedPort
 }
 
-# Routing Table
+# Routing Table (Antigravity & Customer VPN Safe)
 $allRules = [System.Collections.Generic.List[object]]::new()
 $allRules.Add([pscustomobject]@{ action = "sniff" })
 $allRules.Add([pscustomobject]@{ protocol = "dns"; action = "hijack-dns" })
+$allRules.Add([pscustomobject]@{ ip_is_private = $true; outbound = "direct" })
 $allRules.Add([pscustomobject]@{ ip_cidr = @($excludeList); outbound = "direct" })
 foreach ($rr in $rotatorRules) { $allRules.Add($rr) }
 
@@ -565,10 +581,14 @@ $finalConfig = [pscustomobject]@{
     log = [pscustomobject]@{ level = "warn"; timestamp = $true }
     dns = [pscustomobject]@{
         servers = @(
-            [pscustomobject]@{ tag = "dns-remote"; type = "udp"; server = "8.8.8.8"; detour = $rotatingPool[0].tag },
-            [pscustomobject]@{ tag = "dns-local";  type = "local" }
+            [pscustomobject]@{ tag = "dns-remote-tcp"; type = "tcp";   server = "8.8.8.8"; detour = $rotatingPool[0].tag },
+            [pscustomobject]@{ tag = "dns-remote-doh"; type = "https"; server = "https://1.1.1.1/dns-query"; detour = $rotatingPool[0].tag },
+            [pscustomobject]@{ tag = "dns-local";      type = "local" }
         )
-        final   = "dns-remote"
+        rules = @(
+            [pscustomobject]@{ ip_is_private = $true; server = "dns-local" }
+        )
+        final = "dns-remote-tcp"
     }
     inbounds  = @($tunInbound, $mixedInbound)
     outbounds = @($fullOutbounds)
