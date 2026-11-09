@@ -24,6 +24,8 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 | **`reset-network.ps1`** | PowerShell | Core deep network cleanup engine with health & gateway verification. |
 | **`Export-Normal-JSON.bat`** | Batch / Desktop | Extracts pure proxy outbounds from complex configs into clean import format `{ "outbounds": [...] }`. |
 | **`export-normal-json.ps1`** | PowerShell | Core extraction engine: strips TUN, DNS, and routing bloat into a clean, normal JSON file. |
+| **`Deploy-Termux.bat`** | Batch / Desktop | Deploys `termux-vpn.sh` and `config.json` to Termux Android device (`u0_a1384@192.168.1.2:8022`). |
+| **`termux-vpn.sh`** | Bash / Termux | **Termux Dedicated Gateway**: Locked to user `u0_a1384`, IP `192.168.1.2`, password `rooted`. Starts mixed proxy gateway (`192.168.1.2:10808`). |
 | **`install-singbox.ps1`** | PowerShell | Downloads and verifies the official `sing-box.exe` Windows amd64 core binary. |
 
 ---
