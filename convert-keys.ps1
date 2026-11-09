@@ -1,32 +1,32 @@
 <#
 .SYNOPSIS
-    Universal VPN Share Link to sing-box JSON Converter
-    Converts key.txt (ss, vless, vmess, trojan, hysteria2, tuic) into clean sing-box config JSON.
+    Universal VPN Share Link to sing-box JSON Converter (Alive-Only Filter)
+    Probes candidate keys and converts ONLY the working/alive keys into clean sing-box config JSON.
 
 .DESCRIPTION
     1. Reads raw VPN share links from key.txt (or any specified file / base64 subscription).
     2. Parses protocols: ss://, vless://, vmess://, trojan://, hysteria2://, hy2://, tuic://.
     3. Normalizes and deduplicates tags.
-    4. Auto-detects the next available config slot (e.g. config05.json) or writes to a target file.
-    5. Validates syntax with sing-box.exe.
-    6. Probes each converted node to report latency & health status immediately.
+    4. Probes each candidate key using sing-box tools fetch before saving.
+    5. Discards dead, timed out, and expired keys.
+    6. Saves ONLY alive keys into sing-box config JSON.
+    7. Validates syntax with sing-box.exe check.
 
 .PARAMETER InputFile
     Input file containing share links. Defaults to 'key.txt'.
 
 .PARAMETER OutputFile
-    Target output JSON file (e.g. 'config05.json' or 'config.json'). 
+    Target output JSON file (e.g. 'config01.json' or 'config.json'). 
     If omitted, automatically selects the next available 'configXX.json'.
 
-.PARAMETER TestAfterConvert
-    Runs a fast live proxy probe on all converted keys. Defaults to $true.
+.PARAMETER Split
+    Saves each alive key into its own separate config file.
 #>
 
 param(
     [string]$InputFile = "key.txt",
     [string]$OutputFile,
-    [switch]$Split,
-    [switch]$NoTest
+    [switch]$Split
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -459,12 +459,100 @@ if ($parsedOutbounds.Count -eq 0) {
     exit 1
 }
 
+# ----------------------------------------------------------------
+# Live Health Probe & Alive-Only Filter (Before Saving)
+# ----------------------------------------------------------------
+$aliveOutbounds = @()
+$deadCount = 0
+
+if (Test-Path $SingBoxBin) {
+    Write-Host "`n[*] Probing live connectivity of candidate keys (filtering dead keys)..." -ForegroundColor Cyan
+    $probeTmp = Join-Path $env:TEMP ("sb_conv_probe_" + [Guid]::NewGuid().ToString("N") + ".json")
+    $nodeIdx = 0
+
+    foreach ($n in $parsedOutbounds) {
+        $nodeIdx++
+        $originalTag = $n.tag
+
+        # Fast DNS pre-check
+        $dnsOk = $false
+        try {
+            $ips = [System.Net.Dns]::GetHostAddresses($n.server)
+            if ($ips) { $dnsOk = $true }
+        } catch {}
+
+        if (-not $dnsOk) {
+            Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD (DNS Resolve Failed) [DROPPED]" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag) -ForegroundColor Red
+            $deadCount++
+            continue
+        }
+
+        # Deep clone node object so original tag is preserved
+        $cloneObj = ($n | ConvertTo-Json -Depth 10) | ConvertFrom-Json
+        $cloneObj.tag = "probe"
+
+        $pConfig = @{
+            log = @{ level = "error" }
+            outbounds = @($cloneObj)
+        }
+
+        $pJson = $pConfig | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($probeTmp, $pJson, $utf8NoBom)
+
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = $SingBoxBin
+        $pinfo.Arguments = "tools fetch https://www.gstatic.com/generate_204 -c `"$probeTmp`" -o probe"
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.RedirectStandardError = $true
+        $pinfo.UseShellExecute = $false
+        $pinfo.CreateNoWindow = $true
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $proc = [System.Diagnostics.Process]::Start($pinfo)
+        $done = $proc.WaitForExit(3200)
+        $sw.Stop()
+
+        if (-not $done) {
+            try { $proc.Kill() } catch {}
+            Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD (Timeout >3.2s) [DROPPED]" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag) -ForegroundColor Red
+            $deadCount++
+        } elseif ($proc.ExitCode -eq 0) {
+            Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> ALIVE ({4}ms) [KEPT]" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag, $sw.ElapsedMilliseconds) -ForegroundColor Green
+            $aliveOutbounds += $n
+        } else {
+            $err = ($proc.StandardError.ReadToEnd() -split "`n")[0].Trim()
+            if ($err -match "status code: (\d+)") {
+                $err = "Auth error (HTTP $($Matches[1]))"
+            } elseif ($err -match "EOF") {
+                $err = "Server dropped connection (EOF)"
+            } elseif ($err -match "refused") {
+                $err = "Connection refused"
+            }
+            Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD ({4}) [DROPPED]" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag, $err) -ForegroundColor Yellow
+            $deadCount++
+        }
+    }
+    Remove-Item $probeTmp -Force -ErrorAction SilentlyContinue
+
+    if ($aliveOutbounds.Count -eq 0) {
+        Write-Host "`n[-] FAILED: None of the {0} candidate key(s) are alive. No config files were created." -f $parsedOutbounds.Count -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host ("`n[+] Alive Filter Result: {0} alive key(s) kept, {1} dead key(s) dropped." -f $aliveOutbounds.Count, $deadCount) -ForegroundColor Green
+} else {
+    $aliveOutbounds = $parsedOutbounds
+}
+
+# ----------------------------------------------------------------
+# Save ONLY Alive Keys to JSON
+# ----------------------------------------------------------------
 $createdFiles = @()
 
 if ($Split) {
-    Write-Host "`n[*] SPLIT MODE: Creating 1 config JSON file per key..." -ForegroundColor Cyan
-    $idx = 5
-    foreach ($n in $parsedOutbounds) {
+    Write-Host "`n[*] SPLIT MODE: Creating 1 config JSON file per alive key..." -ForegroundColor Cyan
+    $idx = 1
+    foreach ($n in $aliveOutbounds) {
         $candidatePath = $null
         while ($true) {
             $candidateName = ("config{0:D2}.json" -f $idx)
@@ -490,7 +578,7 @@ if ($Split) {
         $targetOutputPath = if ([System.IO.Path]::IsPathRooted($OutputFile)) { $OutputFile } else { Join-Path $ScriptDir $OutputFile }
     } else {
         # Auto-find next available configXX.json
-        $idx = 5
+        $idx = 1
         while ($true) {
             $candidateName = ("config{0:D2}.json" -f $idx)
             $candidatePath = Join-Path $ScriptDir $candidateName
@@ -503,14 +591,14 @@ if ($Split) {
     }
 
     $finalConfig = [ordered]@{
-        outbounds = $parsedOutbounds
+        outbounds = $aliveOutbounds
     }
 
     $jsonOutput = $finalConfig | ConvertTo-Json -Depth 15
     [System.IO.File]::WriteAllText($targetOutputPath, $jsonOutput, $utf8NoBom)
     $createdFiles += $targetOutputPath
 
-    Write-Host ("`n[+] SUCCESS: Saved {0} node(s) to: {1}" -f $parsedOutbounds.Count, (Split-Path -Leaf $targetOutputPath)) -ForegroundColor Green
+    Write-Host ("`n[+] SUCCESS: Saved {0} alive node(s) to: {1}" -f $aliveOutbounds.Count, (Split-Path -Leaf $targetOutputPath)) -ForegroundColor Green
     Write-Host ("    Full Path: {0}" -f $targetOutputPath) -ForegroundColor Gray
 }
 
@@ -527,53 +615,6 @@ if (Test-Path $SingBoxBin) {
     }
     if ($allValid) {
         Write-Host "[+] sing-box validation PASSED for all file(s)!" -ForegroundColor Green
-    }
-
-    # Live Health Probe
-    if (-not $NoTest) {
-        Write-Host "`n[*] Probing live connectivity of newly converted node(s)..." -ForegroundColor Cyan
-        $probeTmp = Join-Path $env:TEMP ("sb_conv_probe_" + [Guid]::NewGuid().ToString("N") + ".json")
-        $nodeIdx = 0
-
-        foreach ($n in $parsedOutbounds) {
-            $nodeIdx++
-            $originalTag = $n.tag
-            # Deep clone node object so original tag is preserved
-            $cloneObj = ($n | ConvertTo-Json -Depth 10) | ConvertFrom-Json
-            $cloneObj.tag = "probe"
-
-            $pConfig = @{
-                log = @{ level = "error" }
-                outbounds = @($cloneObj)
-            }
-
-            $pJson = $pConfig | ConvertTo-Json -Depth 10
-            [System.IO.File]::WriteAllText($probeTmp, $pJson, $utf8NoBom)
-
-            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pinfo.FileName = $SingBoxBin
-            $pinfo.Arguments = "tools fetch https://www.gstatic.com/generate_204 -c `"$probeTmp`" -o probe"
-            $pinfo.RedirectStandardOutput = $true
-            $pinfo.RedirectStandardError = $true
-            $pinfo.UseShellExecute = $false
-            $pinfo.CreateNoWindow = $true
-
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $proc = [System.Diagnostics.Process]::Start($pinfo)
-            $done = $proc.WaitForExit(3200)
-            $sw.Stop()
-
-            if (-not $done) {
-                try { $proc.Kill() } catch {}
-                Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> TIMEOUT (>3.2s)" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag) -ForegroundColor Red
-            } elseif ($proc.ExitCode -eq 0) {
-                Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> ALIVE ({4}ms)" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag, $sw.ElapsedMilliseconds) -ForegroundColor Green
-            } else {
-                $err = ($proc.StandardError.ReadToEnd() -split "`n")[0].Trim()
-                Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> FAILED: {4}" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag, $err) -ForegroundColor Yellow
-            }
-        }
-        Remove-Item $probeTmp -Force -ErrorAction SilentlyContinue
     }
 }
 
