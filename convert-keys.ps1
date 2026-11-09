@@ -26,7 +26,9 @@
 param(
     [string]$InputFile = "key.txt",
     [string]$OutputFile,
-    [switch]$Split
+    [switch]$Split,
+    [int]$Threads = 16,
+    [int]$TimeoutMs = 5000
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -85,28 +87,151 @@ function Parse-QueryString([string]$query) {
     return $dict
 }
 
-# Extract raw key lines (supports base64 subscription blobs)
+# Helper: Extract subscription payload (handles base64, JSON sing-box, or share link lines)
+function Extract-SubscriptionPayload([string]$raw) {
+    $results = [System.Collections.Generic.List[string]]::new()
+    if (-not $raw) { return $results }
+    $trimmed = $raw.Trim()
+
+    # Case A: Base64 encoded blob
+    if ($trimmed -notmatch '://' -and $trimmed.Length -gt 15) {
+        $dec = Decode-Base64 $trimmed
+        if ($dec) { $trimmed = $dec.Trim() }
+    }
+
+    # Case B: Sing-box JSON with outbounds
+    if ($trimmed.StartsWith('{') -and $trimmed.Contains('"outbounds"')) {
+        try {
+            $jsonObj = $trimmed | ConvertFrom-Json
+            if ($jsonObj.outbounds) {
+                # JSON outbounds will be handled directly if passed
+            }
+        } catch {}
+    }
+
+    # Case C: Line-by-line share links or base64 lines
+    foreach ($l in ($trimmed -split "`r?`n")) {
+        $tl = $l.Trim()
+        if ($tl -and -not $tl.StartsWith('#') -and -not $tl.StartsWith('//')) {
+            if ($tl -notmatch '://' -and $tl.Length -gt 25) {
+                $lineDec = Decode-Base64 $tl
+                if ($lineDec -match '://') {
+                    foreach ($subLine in ($lineDec -split "`r?`n")) {
+                        $stl = $subLine.Trim()
+                        if ($stl -match '^[a-z0-9]+://') { $results.Add($stl) }
+                    }
+                    continue
+                }
+            }
+            if ($tl -match '^[a-z0-9]+://') {
+                $results.Add($tl)
+            }
+        }
+    }
+    return $results
+}
+
+# Extract raw key lines (supports URLs, base64 subscriptions, raw links, and JSON)
 function Get-KeyLines([string]$filePath) {
     $rawText = Get-Content -Path $filePath -Raw -Encoding UTF8
     if (-not $rawText) { return @() }
     
     $trimmed = $rawText.Trim()
-    # Check if the entire file is a single base64 subscription blob
-    if ($trimmed -notmatch '://' -and $trimmed.Length -gt 15) {
+    
+    # 1. If whole file is a single base64 subscription blob
+    if ($trimmed -notmatch '://' -and $trimmed.Length -gt 25) {
         $dec = Decode-Base64 $trimmed
-        if ($dec -match '://') {
+        if ($dec -match '://' -or $dec -match '"outbounds"') {
             $rawText = $dec
         }
     }
 
-    $lines = @()
+    # Collect initial lines from file
+    $initialLines = @()
     foreach ($line in ($rawText -split "`r?`n")) {
         $tl = $line.Trim()
         if ($tl -and -not $tl.StartsWith('#') -and -not $tl.StartsWith('//')) {
-            $lines += $tl
+            $initialLines += $tl
         }
     }
-    return $lines
+
+    $urls = @($initialLines | Where-Object { $_ -match '^https?://' })
+    $directKeys = @($initialLines | Where-Object { $_ -notmatch '^https?://' })
+
+    $collectedLines = [System.Collections.Generic.List[string]]::new()
+
+    # Process HTTP/HTTPS Subscription URLs
+    if ($urls.Count -gt 0) {
+        Write-Host ("[*] Detected {0} subscription URL(s) in {1}. Fetching..." -f $urls.Count, (Split-Path $filePath -Leaf)) -ForegroundColor Cyan
+        
+        try { Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue } catch {}
+
+        $hasHttpClient = $false
+        try {
+            $testClient = [System.Net.Http.HttpClient]::new()
+            $testClient.Dispose()
+            $hasHttpClient = $true
+        } catch { $hasHttpClient = $false }
+
+        if ($hasHttpClient) {
+            $httpClient = [System.Net.Http.HttpClient]::new()
+            $httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("v2rayN/6.23")
+            $httpClient.Timeout = [TimeSpan]::FromSeconds(8)
+
+            $tasks = @{}
+            foreach ($u in $urls) {
+                try {
+                    $tasks[$u] = $httpClient.GetStringAsync($u)
+                } catch {}
+            }
+
+            try {
+                [System.Threading.Tasks.Task]::WaitAll(@($tasks.Values))
+            } catch {}
+
+            $uIdx = 0
+            foreach ($u in $urls) {
+                $uIdx++
+                if ($tasks.ContainsKey($u) -and $tasks[$u].Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion) {
+                    $payload = $tasks[$u].Result.Trim()
+                    $subExtracted = Extract-SubscriptionPayload $payload
+                    foreach ($k in $subExtracted) { $collectedLines.Add($k) }
+                    Write-Host ("  [{0}/{1}] Fetched {2} node(s) from: {3}" -f $uIdx, $urls.Count, $subExtracted.Count, $u) -ForegroundColor Green
+                } else {
+                    $curlResp = curl.exe -s -L --max-time 6 -A "v2rayN/6.23" $u
+                    if ($curlResp) {
+                        $subExtracted = Extract-SubscriptionPayload $curlResp.Trim()
+                        foreach ($k in $subExtracted) { $collectedLines.Add($k) }
+                        Write-Host ("  [{0}/{1}] Fetched {2} node(s) (curl fallback) from: {3}" -f $uIdx, $urls.Count, $subExtracted.Count, $u) -ForegroundColor Green
+                    } else {
+                        Write-Host ("  [{0}/{1}] WARNING: Failed to fetch: {2}" -f $uIdx, $urls.Count, $u) -ForegroundColor Yellow
+                    }
+                }
+            }
+            $httpClient.Dispose()
+        } else {
+            $uIdx = 0
+            foreach ($u in $urls) {
+                $uIdx++
+                $curlResp = curl.exe -s -L --max-time 6 -A "v2rayN/6.23" $u
+                if ($curlResp) {
+                    $subExtracted = Extract-SubscriptionPayload $curlResp.Trim()
+                    foreach ($k in $subExtracted) { $collectedLines.Add($k) }
+                    Write-Host ("  [{0}/{1}] Fetched {2} node(s) from: {3}" -f $uIdx, $urls.Count, $subExtracted.Count, $u) -ForegroundColor Green
+                } else {
+                    Write-Host ("  [{0}/{1}] WARNING: Failed to fetch: {2}" -f $uIdx, $urls.Count, $u) -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+
+    # Process direct keys & raw base64 lines
+    foreach ($line in $directKeys) {
+        $extracted = Extract-SubscriptionPayload $line
+        foreach ($k in $extracted) { $collectedLines.Add($k) }
+    }
+
+    return @($collectedLines)
 }
 
 # Protocol Parsers
@@ -197,7 +322,13 @@ function Parse-Vless([string]$uri, [string]$tag) {
                 $node.tls["utls"] = @{ enabled = $true; fingerprint = $q['fp'] }
             }
             if ($q['alpn']) {
-                $node.tls["alpn"] = @($q['alpn'] -split ',')
+                # If transport is ws or httpupgrade, do NOT enforce h2/h3 ALPN
+                # as that breaks standard WebSocket TLS handshakes on CDN fronts!
+                if ($q['type'] -in @("ws", "httpupgrade")) {
+                    $node.tls["alpn"] = @("http/1.1")
+                } else {
+                    $node.tls["alpn"] = @($q['alpn'] -split ',')
+                }
             }
         }
 
@@ -213,8 +344,13 @@ function Parse-Vless([string]$uri, [string]$tag) {
             $svc = if ($q['serviceName']) { $q['serviceName'] } else { $q['path'] }
             if ($svc) { $grpc["service_name"] = $svc }
             $node["transport"] = $grpc
-        } elseif ($type -in @("http", "httpupgrade")) {
-            $tr = [ordered]@{ type = $type }
+        } elseif ($type -eq "httpupgrade") {
+            $hu = [ordered]@{ type = "httpupgrade" }
+            if ($q['path']) { $hu["path"] = $q['path'] }
+            if ($q['host']) { $hu["host"] = $q['host'] }
+            $node["transport"] = $hu
+        } elseif ($type -eq "http") {
+            $tr = [ordered]@{ type = "http" }
             if ($q['path']) { $tr["path"] = $q['path'] }
             if ($q['host']) { $tr["host"] = @($q['host'] -split ',') }
             $node["transport"] = $tr
@@ -265,6 +401,11 @@ function Parse-Vmess([string]$uri, [string]$tag) {
             if ($v.path) { $ws["path"] = $v.path }
             if ($v.host) { $ws["headers"] = @{ Host = $v.host } }
             $node["transport"] = $ws
+        } elseif ($net -eq "httpupgrade") {
+            $hu = [ordered]@{ type = "httpupgrade" }
+            if ($v.path) { $hu["path"] = $v.path }
+            if ($v.host) { $hu["host"] = $v.host }
+            $node["transport"] = $hu
         } elseif ($net -eq "grpc") {
             $node["transport"] = [ordered]@{
                 type         = "grpc"
@@ -408,6 +549,7 @@ if ($keyLines.Count -eq 0) {
 
 $parsedOutbounds = @()
 $tagCounts = @{}
+$seenSignatures = @{}
 
 $lineNum = 0
 foreach ($line in $keyLines) {
@@ -434,11 +576,24 @@ foreach ($line in $keyLines) {
     } elseif ($rawUri.StartsWith("tuic://", [System.StringComparison]::OrdinalIgnoreCase)) {
         $node = Parse-Tuic $rawUri $tag
     } else {
-        Write-Host ("  [?] Line {0}: Unknown or unsupported protocol: {1}" -f $lineNum, ($line.Substring(0, [Math]::Min(20, $line.Length)) + "...")) -ForegroundColor Yellow
+        Write-Host ("  [?] Item {0}: Unknown or unsupported protocol: {1}" -f $lineNum, ($line.Substring(0, [Math]::Min(20, $line.Length)) + "...")) -ForegroundColor Yellow
         continue
     }
 
     if ($node) {
+        $hostHdr = if ($node.transport -and $node.transport.headers -and $node.transport.headers.Host) {
+            $node.transport.headers.Host
+        } elseif ($node.transport -and $node.transport.host) {
+            $node.transport.host
+        } else { "" }
+        $sig = ("{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}" -f $node.type, $node.server, $node.server_port, $node.uuid, $node.password, 
+                ($node.tls.server_name), $hostHdr, ($node.transport.path)).ToLowerInvariant()
+
+        if ($seenSignatures.ContainsKey($sig)) {
+            continue
+        }
+        $seenSignatures[$sig] = $true
+
         # Ensure unique tag
         $cleanTag = $node.tag
         if ($tagCounts.ContainsKey($cleanTag)) {
@@ -448,9 +603,9 @@ foreach ($line in $keyLines) {
             $tagCounts[$cleanTag] = 1
         }
         $parsedOutbounds += $node
-        Write-Host ("  [+] Line {0}: Parsed {1,-10} -> '{2}' ({3}:{4})" -f $lineNum, $node.type, $node.tag, $node.server, $node.server_port) -ForegroundColor Green
+        Write-Host ("  [+] Node {0}: Parsed {1,-10} -> '{2}' ({3}:{4})" -f $parsedOutbounds.Count, $node.type, $node.tag, $node.server, $node.server_port) -ForegroundColor Green
     } else {
-        Write-Host ("  [-] Line {0}: Failed to parse link." -f $lineNum) -ForegroundColor Red
+        Write-Host ("  [-] Item {0}: Failed to parse link." -f $lineNum) -ForegroundColor Red
     }
 }
 
@@ -466,73 +621,126 @@ $aliveOutbounds = @()
 $deadCount = 0
 
 if (Test-Path $SingBoxBin) {
-    Write-Host "`n[*] Probing live connectivity of candidate keys (filtering dead keys)..." -ForegroundColor Cyan
-    $probeTmp = Join-Path $env:TEMP ("sb_conv_probe_" + [Guid]::NewGuid().ToString("N") + ".json")
+    if ($Threads -lt 1) { $Threads = 16 }
+    if ($TimeoutMs -lt 1000) { $TimeoutMs = 5000 }
+    Write-Host ("`n[*] Probing live connectivity of candidate keys with {0} parallel thread(s) (Timeout: {1}ms)..." -f $Threads, $TimeoutMs) -ForegroundColor Cyan
+    
+    $activeJobs = [System.Collections.Generic.List[PSObject]]::new()
+    $totalCandidates = $parsedOutbounds.Count
     $nodeIdx = 0
+    $completedCount = 0
+    $timeoutMs = $TimeoutMs
 
-    foreach ($n in $parsedOutbounds) {
-        $nodeIdx++
-        $originalTag = $n.tag
+    $aliveCollector = [System.Collections.Generic.List[PSObject]]::new()
 
-        # Fast DNS pre-check
-        $dnsOk = $false
-        try {
-            $ips = [System.Net.Dns]::GetHostAddresses($n.server)
-            if ($ips) { $dnsOk = $true }
-        } catch {}
+    while ($nodeIdx -lt $totalCandidates -or $activeJobs.Count -gt 0) {
+        # Fill worker pool up to $Threads
+        while ($nodeIdx -lt $totalCandidates -and $activeJobs.Count -lt $Threads) {
+            $curIdx = $nodeIdx
+            $nodeIdx++
+            $n = $parsedOutbounds[$curIdx]
+            $itemNum = $curIdx + 1
 
-        if (-not $dnsOk) {
-            Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD (DNS Resolve Failed) [DROPPED]" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag) -ForegroundColor Red
-            $deadCount++
-            continue
-        }
+            # Fast DNS pre-check
+            $dnsOk = $false
+            try {
+                $ips = [System.Net.Dns]::GetHostAddresses($n.server)
+                if ($ips) { $dnsOk = $true }
+            } catch {}
 
-        # Deep clone node object so original tag is preserved
-        $cloneObj = ($n | ConvertTo-Json -Depth 10) | ConvertFrom-Json
-        $cloneObj.tag = "probe"
-
-        $pConfig = @{
-            log = @{ level = "error" }
-            outbounds = @($cloneObj)
-        }
-
-        $pJson = $pConfig | ConvertTo-Json -Depth 10
-        [System.IO.File]::WriteAllText($probeTmp, $pJson, $utf8NoBom)
-
-        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo.FileName = $SingBoxBin
-        $pinfo.Arguments = "tools fetch https://www.gstatic.com/generate_204 -c `"$probeTmp`" -o probe"
-        $pinfo.RedirectStandardOutput = $true
-        $pinfo.RedirectStandardError = $true
-        $pinfo.UseShellExecute = $false
-        $pinfo.CreateNoWindow = $true
-
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $proc = [System.Diagnostics.Process]::Start($pinfo)
-        $done = $proc.WaitForExit(3200)
-        $sw.Stop()
-
-        if (-not $done) {
-            try { $proc.Kill() } catch {}
-            Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD (Timeout >3.2s) [DROPPED]" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag) -ForegroundColor Red
-            $deadCount++
-        } elseif ($proc.ExitCode -eq 0) {
-            Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> ALIVE ({4}ms) [KEPT]" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag, $sw.ElapsedMilliseconds) -ForegroundColor Green
-            $aliveOutbounds += $n
-        } else {
-            $err = ($proc.StandardError.ReadToEnd() -split "`n")[0].Trim()
-            if ($err -match "status code: (\d+)") {
-                $err = "Auth error (HTTP $($Matches[1]))"
-            } elseif ($err -match "EOF") {
-                $err = "Server dropped connection (EOF)"
-            } elseif ($err -match "refused") {
-                $err = "Connection refused"
+            if (-not $dnsOk) {
+                $completedCount++
+                $deadCount++
+                Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD (DNS Resolve Failed) [DROPPED]" -f $itemNum, $totalCandidates, $n.type, $n.tag) -ForegroundColor Red
+                continue
             }
-            Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD ({4}) [DROPPED]" -f $nodeIdx, $parsedOutbounds.Count, $n.type, $originalTag, $err) -ForegroundColor Yellow
-            $deadCount++
+
+            # Setup temp probe config
+            $probeTmp = Join-Path $env:TEMP ("sb_conv_probe_" + [Guid]::NewGuid().ToString("N") + ".json")
+            $cloneObj = ($n | ConvertTo-Json -Depth 10) | ConvertFrom-Json
+            $cloneObj.tag = "probe"
+
+            $pConfig = @{
+                log = @{ level = "error" }
+                outbounds = @($cloneObj)
+            }
+            $pJson = $pConfig | ConvertTo-Json -Depth 10
+            [System.IO.File]::WriteAllText($probeTmp, $pJson, $utf8NoBom)
+
+            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = $SingBoxBin
+            $pinfo.Arguments = "tools fetch https://www.gstatic.com/generate_204 -c `"$probeTmp`" -o probe"
+            $pinfo.RedirectStandardOutput = $true
+            $pinfo.RedirectStandardError = $true
+            $pinfo.UseShellExecute = $false
+            $pinfo.CreateNoWindow = $true
+
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $proc = [System.Diagnostics.Process]::Start($pinfo)
+
+            $activeJobs.Add([PSObject]@{
+                Process   = $proc
+                Stopwatch = $sw
+                TmpFile   = $probeTmp
+                Node      = $n
+                Index     = $itemNum
+            })
+            Start-Sleep -Milliseconds 25
+        }
+
+        # Check running workers
+        if ($activeJobs.Count -gt 0) {
+            $stillRunning = [System.Collections.Generic.List[PSObject]]::new()
+            foreach ($job in $activeJobs) {
+                $p = $job.Process
+                $sw = $job.Stopwatch
+                $elapsed = $sw.ElapsedMilliseconds
+
+                if ($p.HasExited) {
+                    $sw.Stop()
+                    $exitCode = $p.ExitCode
+                    $errText = ""
+                    try { $errText = ($p.StandardError.ReadToEnd() -split "`n")[0].Trim() } catch {}
+                    $p.Dispose()
+                    Remove-Item $job.TmpFile -Force -ErrorAction SilentlyContinue
+
+                    $completedCount++
+                    if ($exitCode -eq 0) {
+                        $aliveCollector.Add($job.Node)
+                        Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> ALIVE ({4}ms) [KEPT]" -f $job.Index, $totalCandidates, $job.Node.type, $job.Node.tag, $elapsed) -ForegroundColor Green
+                    } else {
+                        $deadCount++
+                        $err = $errText
+                        if ($err -match "status code: (\d+)") {
+                            $err = "Auth error (HTTP $($Matches[1]))"
+                        } elseif ($err -match "EOF") {
+                            $err = "Server dropped connection (EOF)"
+                        } elseif ($err -match "refused") {
+                            $err = "Connection refused"
+                        } elseif ($err -match "reality verification failed") {
+                            $err = "Reality handshake failed"
+                        }
+                        if (-not $err) { $err = "Failed" }
+                        Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD ({4}) [DROPPED]" -f $job.Index, $totalCandidates, $job.Node.type, $job.Node.tag, $err) -ForegroundColor Yellow
+                    }
+                } elseif ($elapsed -gt $timeoutMs) {
+                    $sw.Stop()
+                    try { $p.Kill(); $p.Dispose() } catch {}
+                    Remove-Item $job.TmpFile -Force -ErrorAction SilentlyContinue
+
+                    $completedCount++
+                    $deadCount++
+                    Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD (Timeout >$($timeoutMs)ms) [DROPPED]" -f $job.Index, $totalCandidates, $job.Node.type, $job.Node.tag) -ForegroundColor Red
+                } else {
+                    $stillRunning.Add($job)
+                }
+            }
+            $activeJobs = $stillRunning
+            Start-Sleep -Milliseconds 25
         }
     }
-    Remove-Item $probeTmp -Force -ErrorAction SilentlyContinue
+
+    $aliveOutbounds = @($aliveCollector)
 
     if ($aliveOutbounds.Count -eq 0) {
         Write-Host ("`n[-] FAILED: None of the {0} candidate key(s) are alive. No config files were created." -f $parsedOutbounds.Count) -ForegroundColor Red

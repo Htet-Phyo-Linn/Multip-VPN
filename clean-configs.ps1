@@ -106,8 +106,14 @@ function Get-NodeSignature($node) {
     $prt  = if ($node.server_port) { $node.server_port } else { "" }
     $uuid = if ($node.uuid) { $node.uuid } else { "" }
     $pwd  = if ($node.password) { $node.password } else { "" }
+    $sni  = if ($node.tls -and $node.tls.server_name) { $node.tls.server_name } else { "" }
+    $hostHeader = if ($node.transport -and $node.transport.headers -and $node.transport.headers.Host) { 
+        $node.transport.headers.Host 
+    } elseif ($node.transport -and $node.transport.host) {
+        $node.transport.host
+    } else { "" }
     $path = if ($node.transport -and $node.transport.path) { $node.transport.path } else { "" }
-    return "$type|$srv|$prt|$uuid|$pwd|$path".ToLowerInvariant()
+    return "$type|$srv|$prt|$uuid|$pwd|$sni|$hostHeader|$path".ToLowerInvariant()
 }
 
 function Test-SingBoxNodeConnectivity($nodeObj) {

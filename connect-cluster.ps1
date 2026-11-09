@@ -272,7 +272,16 @@ foreach ($jf in $jsonFiles) {
             if ($ob.type -in @("direct", "block", "dns", "selector", "urltest")) { continue }
             if (-not $ob.server -or $ob.server -eq "example.com" -or $ob.server -like "*00000000*") { continue }
 
-            $endpointKey = "$($ob.type)://$($ob.server):$($ob.server_port)"
+            $sni = if ($ob.tls -and $ob.tls.server_name) { $ob.tls.server_name } else { "" }
+            $hostHdr = if ($ob.transport -and $ob.transport.headers -and $ob.transport.headers.Host) {
+                $ob.transport.headers.Host
+            } elseif ($ob.transport -and $ob.transport.host) {
+                $ob.transport.host
+            } else { "" }
+            $path = if ($ob.transport -and $ob.transport.path) { $ob.transport.path } else { "" }
+            $uuid = if ($ob.uuid) { $ob.uuid } elseif ($ob.password) { $ob.password } else { "" }
+
+            $endpointKey = "$($ob.type)://$($ob.server):$($ob.server_port)|$sni|$hostHdr|$path|$uuid".ToLowerInvariant()
             if ($seenEndpoints.Contains($endpointKey)) { continue }
             $null = $seenEndpoints.Add($endpointKey)
 
