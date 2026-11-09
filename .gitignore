@@ -9,6 +9,7 @@ key.txt
 
 # VPN Configurations (contains private keys/uuids)
 config*.json
+normal*.json
 !config.example.json
 
 # Runtime dynamic files & cache

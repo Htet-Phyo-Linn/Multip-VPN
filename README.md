@@ -16,6 +16,8 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 | **`clean-configs.ps1`** | PowerShell | Core health cleaner & consolidator engine with customizable parameters (`-DryRun`, `-KeepSplit`, `-TargetFile`). |
 | **`Convert-Keys.bat`** | Batch / Desktop | Interactive converter: converts `key.txt` into sing-box JSON with a choice of **Bundle (1 file)** or **Split (1 key per file)**. |
 | **`convert-keys.ps1`** | PowerShell | Core key converter engine supporting Shadowsocks, VLESS, VMess, Trojan, Hysteria 2, and TUIC. |
+| **`Export-Normal-JSON.bat`** | Batch / Desktop | Extracts pure proxy outbounds from complex configs into clean import format `{ "outbounds": [...] }`. |
+| **`export-normal-json.ps1`** | PowerShell | Core extraction engine: strips TUN, DNS, and routing bloat into a clean, normal JSON file. |
 | **`install-singbox.ps1`** | PowerShell | Downloads and verifies the official `sing-box.exe` Windows amd64 core binary. |
 
 ---
@@ -126,7 +128,35 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 
 ---
 
-### 5. Setup & Binary Installation
+### 5. Config to Normal JSON Converter
+
+#### `Export-Normal-JSON.bat`
+* **Purpose**: Extracts real proxy nodes from any complex sing-box configuration (such as `_singbox_cluster_run.json` or any full TUN config) and exports them into clean, standard `{ "outbounds": [ ... ] }` JSON format just like your imported `config.json`.
+* **Usage**:
+  * Double-click to extract the currently running cluster nodes into `normal_config.json`.
+  * Drag and drop any complex sing-box JSON file onto `Export-Normal-JSON.bat` to convert it.
+
+#### `export-normal-json.ps1`
+* **Purpose**: PowerShell execution of the normal JSON extractor.
+* **Parameters**:
+  * `-InputFile <path>`: Source JSON config (defaults to `_singbox_cluster_run.json` or `config.json`).
+  * `-OutputFile <path>`: Destination file (defaults to `normal_config.json`).
+  * `-OverwriteMaster`: Directly updates `config.json` (creates a timestamped backup first).
+* **Usage**:
+  ```powershell
+  # Extract active cluster nodes into normal_config.json
+  .\export-normal-json.ps1
+
+  # Extract from a specific file
+  .\export-normal-json.ps1 -InputFile "_singbox_cluster_run.json" -OutputFile "my_normal_config.json"
+
+  # Extract and update master config.json directly (with safety backup)
+  .\export-normal-json.ps1 -OverwriteMaster
+  ```
+
+---
+
+### 6. Setup & Binary Installation
 
 #### `install-singbox.ps1`
 * **Purpose**: Downloads and unpacks the official `sing-box.exe` Windows amd64 core binary from GitHub Releases into the project folder.
