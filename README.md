@@ -20,6 +20,8 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 | **`clean-configs.ps1`** | PowerShell | Core health cleaner & consolidator engine with 16 parallel workers and configurable `-TimeoutMs 9000`. |
 | **`Convert-Keys.bat`** | Batch / Desktop | Interactive converter: converts `key.txt` (URLs, base64, share links) into sing-box JSON with 16 parallel threads. |
 | **`convert-keys.ps1`** | PowerShell | Core key converter engine supporting subscriptions, Shadowsocks, VLESS, VMess, Trojan, Hysteria 2, and TUIC. |
+| **`Reset-Network.bat`** | Batch / Desktop | **Emergency 1-Click Network Clean & Restoration**: Restores Windows TCP/IP stack to clean post-reboot state (kills rogue sing-box, purges static /32 routes, clears firewall rules, disables proxy, flushes DNS & ARP). |
+| **`reset-network.ps1`** | PowerShell | Core deep network cleanup engine with health & gateway verification. |
 | **`Export-Normal-JSON.bat`** | Batch / Desktop | Extracts pure proxy outbounds from complex configs into clean import format `{ "outbounds": [...] }`. |
 | **`export-normal-json.ps1`** | PowerShell | Core extraction engine: strips TUN, DNS, and routing bloat into a clean, normal JSON file. |
 | **`install-singbox.ps1`** | PowerShell | Downloads and verifies the official `sing-box.exe` Windows amd64 core binary. |
@@ -180,7 +182,29 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 
 ---
 
-### 6. Setup & Binary Installation
+### 6. Emergency Network Clean & Factory Restoration (Reboot-Free)
+
+#### `Reset-Network.bat` / `reset-network.ps1`
+* **Purpose**: If a VPN session is stopped abruptly (e.g. terminal window closed without graceful Ctrl+C, or power loss), Windows may be left with orphan `/32` static routes, dead proxy settings, or hijacked DNS entries. This tool scrubs the entire Windows TCP/IP networking stack back to a clean, pristine post-reboot state in under 2 seconds **without needing to restart your computer**.
+* **What It Does**:
+  1. Force-terminates all running/hung `sing-box.exe` processes.
+  2. Disables and removes any orphaned `wintun` / `sing-tun` virtual adapters.
+  3. Sweeps and purges all lingering `/32` static bypass routes from Windows ActiveStore.
+  4. Deletes all `MultipVPN*` firewall allow rules.
+  5. Disables Windows Internet Proxy (WinINet) and broadcasts `InternetSetOption` to all browsers.
+  6. Flushes the DNS resolver cache and resets static loopback DNS to automatic DHCP.
+  7. Wipes stale ARP and NetBIOS cache bindings.
+  8. Purges temporary runtime configs (`_singbox_*.json`).
+  9. Tests and verifies physical gateway ping and direct internet connectivity.
+  10. **Customer VPN Safe**: Preserves Cisco AnyConnect, FortiClient, and corporate subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
+* **Usage**: Double-click `Reset-Network.bat` (prompts for UAC Administrator elevation) or run:
+  ```powershell
+  .\reset-network.ps1
+  ```
+
+---
+
+### 7. Setup & Binary Installation
 
 #### `install-singbox.ps1`
 * **Purpose**: Downloads and unpacks the official `sing-box.exe` Windows amd64 core binary from GitHub Releases into the project folder.

@@ -93,19 +93,27 @@ function Invoke-Cleanup {
         Write-Ok "  Bypass routes cleared."
     }
 
-    if ($CreatedFirewallRules.Count -gt 0) {
-        Write-Info "Removing firewall rule(s)..."
-        foreach ($rule in $CreatedFirewallRules) {
-            try {
-                Remove-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue
-            } catch {}
-        }
-        Write-Ok "  Firewall rules cleared."
+    # Also perform safety bulk sweep for any lingering /32 routes pointing to gateway
+    if ($gw -and $gw.Gateway) {
+        try {
+            Get-NetRoute -DestinationPrefix "*/32" -NextHop $gw.Gateway -RouteMetric 5 -ErrorAction SilentlyContinue |
+                Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+        } catch {}
     }
+
+    # Fast bulk removal of MultipVPN firewall rules
+    try {
+        Remove-NetFirewallRule -DisplayName "MultipVPN*" -ErrorAction SilentlyContinue
+        Write-Ok "  Firewall rules cleared."
+    } catch {}
 
     if ($TempConfigPath -and (Test-Path $TempConfigPath)) {
         Remove-Item $TempConfigPath -Force -ErrorAction SilentlyContinue
     }
+
+    # Flush DNS and ensure system proxy is disabled
+    try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
+    try { Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -Name ProxyEnable -Value 0 -ErrorAction SilentlyContinue } catch {}
 
     Write-Ok "Network completely restored. Customer VPN is intact."
 }
