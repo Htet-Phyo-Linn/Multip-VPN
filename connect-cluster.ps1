@@ -240,7 +240,12 @@ Write-Ok "sing-box engine: $singBoxExe"
 # 2. Find and inspect all JSON config files in the target directory
 Write-Info "Scanning for VPN configuration files in: $ConfigFolder"
 $jsonFiles = Get-ChildItem -Path $ConfigFolder -Filter "*.json" |
-             Where-Object { $_.Name -notlike "_singbox*" -and $_.Name -notlike "_geo*" }
+             Where-Object { 
+                 $_.Name -notlike "_singbox*" -and 
+                 $_.Name -notlike "_geo*" -and 
+                 $_.Name -notlike "*.example.json" -and 
+                 $_.Name -notlike "normal_config*.json" 
+             }
 
 if (-not $jsonFiles -or $jsonFiles.Count -eq 0) {
     Write-Err "No JSON config files found in $ConfigFolder!"
@@ -265,7 +270,7 @@ foreach ($jf in $jsonFiles) {
 
         foreach ($ob in $obs) {
             if ($ob.type -in @("direct", "block", "dns", "selector", "urltest")) { continue }
-            if (-not $ob.server) { continue }
+            if (-not $ob.server -or $ob.server -eq "example.com" -or $ob.server -like "*00000000*") { continue }
 
             $endpointKey = "$($ob.type)://$($ob.server):$($ob.server_port)"
             if ($seenEndpoints.Contains($endpointKey)) { continue }

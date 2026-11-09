@@ -183,7 +183,11 @@ if ($TargetFile) {
     }
 } else {
     $configFiles = Get-ChildItem -Path $ScriptDir -Filter "config*.json" | 
-        Where-Object { $_.Name -notmatch '^_singbox' } |
+        Where-Object { 
+            $_.Name -notmatch '^_singbox' -and 
+            $_.Name -notmatch '\.example\.json$' -and 
+            $_.Name -notmatch '^normal_config' 
+        } |
         Sort-Object Name
 }
 
@@ -257,6 +261,8 @@ foreach ($file in $configFiles) {
         $server = $node.server
         $port   = $node.server_port
         $tag    = $node.tag
+
+        if ($server -eq "example.com" -or $server -like "*00000000*") { continue }
 
         # Check for duplicate node
         $sig = Get-NodeSignature $node

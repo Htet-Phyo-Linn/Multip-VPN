@@ -535,7 +535,7 @@ if (Test-Path $SingBoxBin) {
     Remove-Item $probeTmp -Force -ErrorAction SilentlyContinue
 
     if ($aliveOutbounds.Count -eq 0) {
-        Write-Host "`n[-] FAILED: None of the {0} candidate key(s) are alive. No config files were created." -f $parsedOutbounds.Count -ForegroundColor Red
+        Write-Host ("`n[-] FAILED: None of the {0} candidate key(s) are alive. No config files were created." -f $parsedOutbounds.Count) -ForegroundColor Red
         exit 1
     }
 
