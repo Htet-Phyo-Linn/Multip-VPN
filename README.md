@@ -10,12 +10,16 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 | :--- | :---: | :--- |
 | **`Connect-Cluster.bat`** | Batch / Desktop | Starts the **Load-Balanced Cluster** (lowest-ping auto-failover across all available working nodes). |
 | **`connect-cluster.ps1`** | PowerShell | Core engine for the load-balanced cluster. Discovers all nodes, filters blocked countries, and builds the TUN tunnel. |
+| **`Connect-Rotator.bat`** | Batch / Desktop | Starts the **Per-Connection Round-Robin Rotator** (every single connection exits via a different country/IP). |
+| **`connect-rotator.ps1`** | PowerShell | Core kernel source-port modulo randomizer engine with TUN & rotating SOCKS5/HTTP proxy (`127.0.0.1:10808`). |
+| **`Test-Rotation.bat`** | Batch / Desktop | Verifies live IP rotation by issuing 6 rapid requests and displaying the changing public IPs/countries. |
+| **`test-rotation.ps1`** | PowerShell | IP rotation diagnostic and verification script. |
 | **`Connect-VPN.bat`** | Batch / Desktop | Starts a **Single VPN connection** using `config.json`. Supports dragging & dropping any `.json` config onto it. |
 | **`connect-vpn.ps1`** | PowerShell | Connects to a specific single configuration file in transparent TUN mode. |
-| **`Clean-Configs.bat`** | Batch / Desktop | 1-Click health check: tests all nodes, filters out blocked countries, merges all working nodes into `config.json`, and deletes secondary files. |
-| **`clean-configs.ps1`** | PowerShell | Core health cleaner & consolidator engine with customizable parameters (`-DryRun`, `-KeepSplit`, `-TargetFile`). |
-| **`Convert-Keys.bat`** | Batch / Desktop | Interactive converter: converts `key.txt` into sing-box JSON with a choice of **Bundle (1 file)** or **Split (1 key per file)**. |
-| **`convert-keys.ps1`** | PowerShell | Core key converter engine supporting Shadowsocks, VLESS, VMess, Trojan, Hysteria 2, and TUIC. |
+| **`Clean-Configs.bat`** | Batch / Desktop | 1-Click health check: tests all nodes (16 threads, 9s delay), filters blocked countries, merges all working nodes into `config.json`. |
+| **`clean-configs.ps1`** | PowerShell | Core health cleaner & consolidator engine with 16 parallel workers and configurable `-TimeoutMs 9000`. |
+| **`Convert-Keys.bat`** | Batch / Desktop | Interactive converter: converts `key.txt` (URLs, base64, share links) into sing-box JSON with 16 parallel threads. |
+| **`convert-keys.ps1`** | PowerShell | Core key converter engine supporting subscriptions, Shadowsocks, VLESS, VMess, Trojan, Hysteria 2, and TUIC. |
 | **`Export-Normal-JSON.bat`** | Batch / Desktop | Extracts pure proxy outbounds from complex configs into clean import format `{ "outbounds": [...] }`. |
 | **`export-normal-json.ps1`** | PowerShell | Core extraction engine: strips TUN, DNS, and routing bloat into a clean, normal JSON file. |
 | **`install-singbox.ps1`** | PowerShell | Downloads and verifies the official `sing-box.exe` Windows amd64 core binary. |
@@ -40,7 +44,27 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 
 ---
 
-### 2. Single VPN Connection
+### 2. Per-Connection Round-Robin Rotator (Full Randomizer)
+
+#### `Connect-Rotator.bat`
+* **Purpose**: Starts the **Hacker-Style Per-Connection Round-Robin Rotator**. Every single TCP connection exits through a different proxy node across different countries (Japan, Singapore, US, Canada, Germany, Spain, UK, etc.).
+* **Features**:
+  * **Kernel Source-Port Modulo**: Routes connections based on Windows ephemeral port allocation. Connection 1 goes to Japan, Connection 2 to Singapore, Connection 3 to the US, Connection 4 to Germany, etc.
+  * **Transparent System TUN**: Automatically captures all system traffic.
+  * **Local Rotating Proxy (`127.0.0.1:10808`)**: Mixed SOCKS5/HTTP proxy for curl, Python scrapers, and browser extensions.
+  * **Bypasses Physical Gateway**: Safe to run alongside Customer VPNs (FortiClient, AnyConnect).
+* **Usage**: Double-click `Connect-Rotator.bat` or run in terminal.
+
+#### `Test-Rotation.bat` / `test-rotation.ps1`
+* **Purpose**: Rapidly issues 6 test requests and prints the resulting IP addresses and countries in the console to visually confirm live per-connection rotation.
+* **Usage**:
+  ```cmd
+  .\Test-Rotation.bat
+  ```
+
+---
+
+### 3. Single VPN Connection
 
 #### `Connect-VPN.bat`
 * **Purpose**: Connects your computer to a single VPN configuration file (`config.json` by default).
