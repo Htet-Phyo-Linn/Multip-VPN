@@ -218,6 +218,126 @@ function Save-GeoCache {
     } catch {}
 }
 
+function Resolve-GeoLocationsParallel {
+    param(
+        [string[]]$IPs,
+        [string]$Token = "a1e1161ecc1b38"
+    )
+
+    $results = @{}
+    if (-not $IPs -or $IPs.Count -eq 0) { return $results }
+
+    # 1. Hit memory cache first
+    $uncached = [System.Collections.Generic.List[string]]::new()
+    foreach ($ip in $IPs) {
+        if ($script:GeoCache.ContainsKey($ip)) {
+            $results[$ip] = $script:GeoCache[$ip]
+        } else {
+            $uncached.Add($ip)
+        }
+    }
+
+    if ($uncached.Count -eq 0) { return $results }
+
+    # 2. Batch query via ip-api.com (100 IPs per call in ~150ms)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $chunkSize = 100
+    for ($i = 0; $i -lt $uncached.Count; $i += $chunkSize) {
+        $chunk = @($uncached[$i..([Math]::Min($i + $chunkSize - 1, $uncached.Count - 1))])
+        try {
+            $jsonBody = $chunk | ConvertTo-Json -Compress
+            $tempFile = [System.IO.Path]::GetTempFileName()
+            [System.IO.File]::WriteAllText($tempFile, $jsonBody, $utf8NoBom)
+            $respRaw = & curl.exe -s -m 4 -d "@$tempFile" -H "Content-Type: application/json" "http://ip-api.com/batch?fields=query,country,countryCode,city"
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+
+            if ($respRaw) {
+                $batchList = $respRaw | ConvertFrom-Json
+                foreach ($item in $batchList) {
+                    if ($item.countryCode) {
+                        $entry = [pscustomobject]@{
+                            country = $item.countryCode.ToString().Trim().ToUpper()
+                            city    = if ($item.city) { $item.city.ToString() } else { "" }
+                        }
+                        $results[$item.query] = $entry
+                        $script:GeoCache[$item.query] = $entry
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    # 3. For any remaining missing IPs, run concurrent multi-threaded fallback (16 workers)
+    $stillMissing = @($uncached | Where-Object { -not $results.ContainsKey($_) })
+    if ($stillMissing.Count -gt 0) {
+        $maxWorkers = [Math]::Min(16, $stillMissing.Count)
+        $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $maxWorkers)
+        $pool.Open()
+        $jobs = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($mIp in $stillMissing) {
+            $ps = [System.Management.Automation.PowerShell]::Create().AddScript({
+                param($ip, $tok)
+                # Primary fallback: ipinfo.io
+                try {
+                    $url = if ($tok) { "https://ipinfo.io/$ip/json?token=$tok" } else { "https://ipinfo.io/$ip/json" }
+                    $r = & curl.exe -s -m 3 $url
+                    if ($r) {
+                        $d = $r | ConvertFrom-Json
+                        if ($d.country) {
+                            return [pscustomobject]@{
+                                ip      = $ip
+                                country = $d.country.ToString().Trim().ToUpper()
+                                city    = if ($d.city) { $d.city.ToString() } else { "" }
+                            }
+                        }
+                    }
+                } catch {}
+
+                # Secondary fallback: ipwho.is
+                try {
+                    $r = & curl.exe -s -m 3 "https://ipwho.is/$ip"
+                    if ($r) {
+                        $d = $r | ConvertFrom-Json
+                        if ($d.country_code) {
+                            return [pscustomobject]@{
+                                ip      = $ip
+                                country = $d.country_code.ToString().Trim().ToUpper()
+                                city    = if ($d.city) { $d.city.ToString() } else { "" }
+                            }
+                        }
+                    }
+                } catch {}
+
+                return [pscustomobject]@{ ip = $ip; country = "UNKNOWN"; city = "" }
+            }).AddArgument($mIp).AddArgument($Token)
+
+            $ps.RunspacePool = $pool
+            $jobs.Add([pscustomobject]@{ Pipe = $ps; Handle = $ps.BeginInvoke() })
+        }
+
+        foreach ($job in $jobs) {
+            try {
+                $res = $job.Pipe.EndInvoke($job.Handle)
+                if ($res -and $res.ip -and $res.country -and $res.country -ne "UNKNOWN") {
+                    $entry = [pscustomobject]@{
+                        country = $res.country
+                        city    = $res.city
+                    }
+                    $results[$res.ip] = $entry
+                    $script:GeoCache[$res.ip] = $entry
+                }
+            } catch {} finally {
+                $job.Pipe.Dispose()
+            }
+        }
+        $pool.Close()
+        $pool.Dispose()
+    }
+
+    return $results
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CLUSTER DISCOVERY & GEOLOCATION FILTER ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -311,54 +431,83 @@ Write-Info "Checking IP geolocations against Antigravity blocked list..."
 Write-Host "   Blocked regions: $($BlockedCountries -join ', ')" -ForegroundColor DarkGray
 Write-Host ""
 
-# 4. Resolve endpoints, check IP location, and apply Blocklist Filter
+# 4. Resolve endpoints, check IP location, and apply Blocklist Filter (High-Speed Multi-Threaded Engine)
 $serverStatusMap  = @{}  # Server -> Allowed (true/false)
 $hostsMap         = [pscustomobject]@{}
 $allowedServerIPs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
+Write-Info "Resolving DNS for $($uniqueServers.Count) server endpoint(s) in parallel..."
+$dnsTasks = @{}
+$resolvedServerIPs = @{}  # Server string -> Primary IPv4 string
+
 foreach ($srv in $uniqueServers) {
     $parsedIP = $null
-    $targetIp = $null
-
     if ([System.Net.IPAddress]::TryParse($srv, [ref]$parsedIP)) {
         if ($parsedIP.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
-            $targetIp = $parsedIP.ToString()
+            $resolvedServerIPs[$srv] = $parsedIP.ToString()
         }
     } else {
         try {
-            $resolved = [System.Net.Dns]::GetHostAddresses($srv) |
-                        Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }
-            if ($resolved) {
-                $targetIp = ($resolved | Select-Object -First 1).ToString()
-                $ipStrings = @($resolved | ForEach-Object { $_.ToString() })
-                $hostsMap | Add-Member -MemberType NoteProperty -Name $srv -Value $ipStrings -Force
-            }
-        } catch {
-            Write-Warn "  Could not resolve ${srv}: $_"
-        }
+            $dnsTasks[$srv] = [System.Net.Dns]::GetHostAddressesAsync($srv)
+        } catch {}
+    }
+}
+
+if ($dnsTasks.Count -gt 0) {
+    try {
+        [System.Threading.Tasks.Task]::WaitAll(@($dnsTasks.Values), 3500) | Out-Null
+    } catch {
+        # Unresolvable domains or timeouts handled below
     }
 
-    if (-not $targetIp) {
+    foreach ($kv in $dnsTasks.GetEnumerator()) {
+        $srv = $kv.Key
+        $task = $kv.Value
+        if ($task.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion -and $task.Result) {
+            $ipv4List = @($task.Result | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork })
+            if ($ipv4List.Count -gt 0) {
+                $primary = $ipv4List[0].ToString()
+                $resolvedServerIPs[$srv] = $primary
+                $ipStrings = @($ipv4List | ForEach-Object { $_.ToString() })
+                $hostsMap | Add-Member -MemberType NoteProperty -Name $srv -Value $ipStrings -Force
+            }
+        }
+    }
+}
+
+# Collect all unique IPv4 targets for parallel geo lookup
+$targetIPs = @($resolvedServerIPs.Values | Select-Object -Unique)
+Write-Info "Querying geolocations for $($targetIPs.Count) IP(s) in parallel (batch & cache)..."
+$geoResults = Resolve-GeoLocationsParallel -IPs $targetIPs -Token $IpInfoToken
+Save-GeoCache
+
+# Apply filter and display status
+$approvedCount = 0
+$blockedCount  = 0
+
+foreach ($srv in $uniqueServers) {
+    if (-not $resolvedServerIPs.ContainsKey($srv)) {
+        Write-Host "  [-] UNRESOLVED: $srv -> Excluded (DNS resolution failed)" -ForegroundColor DarkGray
         $serverStatusMap[$srv] = $false
         continue
     }
 
-    # Query IPinfo geolocation
-    $geo = Get-ServerGeoLocation -ip $targetIp
-    $countryCode = if ($geo) { $geo.country } else { "UNKNOWN" }
+    $targetIp = $resolvedServerIPs[$srv]
+    $geo = if ($geoResults.ContainsKey($targetIp)) { $geoResults[$targetIp] } else { $null }
+    $countryCode = if ($geo -and $geo.country) { $geo.country } else { "UNKNOWN" }
     $city = if ($geo -and $geo.city) { " ($($geo.city))" } else { "" }
 
     if ($BlockedCountries -contains $countryCode) {
         Write-Host "  [-] BLOCKED: $srv [$countryCode]$city -> Excluded (Antigravity unsupported)" -ForegroundColor Red
         $serverStatusMap[$srv] = $false
+        $blockedCount++
     } else {
         Write-Host "  [+] ALLOWED: $srv [$countryCode]$city -> Approved" -ForegroundColor Green
         $serverStatusMap[$srv] = $true
         $null = $allowedServerIPs.Add($targetIp)
+        $approvedCount++
     }
 }
-
-Save-GeoCache
 
 # 5. Filter nodes: Keep only nodes whose server passed the country blocklist
 $approvedNodes = [System.Collections.Generic.List[object]]::new()

@@ -88,17 +88,37 @@ function Get-NodeGeoInfo([string]$IpAddress) {
     }
 
     $geo = @{ country = "UNKNOWN"; city = "Unknown" }
+    # Primary fast lookup: ip-api.com line format via curl
     try {
-        $url = "https://ipinfo.io/$IpAddress/json?token=$IpInfoToken"
-        $resp = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 4 -ErrorAction Stop
-        if ($resp.country) { $geo.country = [string]$resp.country }
-        if ($resp.city)    { $geo.city    = [string]$resp.city }
-        $GeoCache[$IpAddress] = $geo
-        Save-GeoCache
-    } catch {
-        $geo.country = "UNKNOWN"
-        $geo.city = "Unknown"
-    }
+        $respRaw = & curl.exe -s -m 3 "http://ip-api.com/line/${IpAddress}?fields=countryCode,city"
+        if ($respRaw) {
+            $lines = @($respRaw -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
+            if ($lines.Count -ge 1) {
+                $geo.country = $lines[0].Trim().ToUpper()
+                $geo.city    = if ($lines.Count -ge 2) { $lines[1].Trim() } else { "Unknown" }
+                $GeoCache[$IpAddress] = $geo
+                Save-GeoCache
+                return $geo
+            }
+        }
+    } catch {}
+
+    # Secondary lookup: ipinfo.io via curl
+    try {
+        $url = if ($IpInfoToken) { "https://ipinfo.io/$IpAddress/json?token=$IpInfoToken" } else { "https://ipinfo.io/$IpAddress/json" }
+        $respRaw = & curl.exe -s -m 3 $url
+        if ($respRaw) {
+            $d = $respRaw | ConvertFrom-Json
+            if ($d.country) {
+                $geo.country = $d.country.ToString().Trim().ToUpper()
+                $geo.city    = if ($d.city) { $d.city.ToString() } else { "Unknown" }
+                $GeoCache[$IpAddress] = $geo
+                Save-GeoCache
+                return $geo
+            }
+        }
+    } catch {}
+
     return $geo
 }
 
