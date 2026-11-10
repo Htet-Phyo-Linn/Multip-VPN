@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Sing-box Multi-Config Cluster & Auto Load Balancer (Tor-style multi-exit)
     - Ingests ALL config*.json files in the folder and aggregates all free keys.
@@ -16,11 +16,16 @@ param(
     [string]$ConfigFolder     = $PSScriptRoot,
     [string]$SingBoxPath      = "",
     [string[]]$CustomerSubnets = @("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"),
+    [string[]]$CorpDomains    = @(),
     [string]$IpInfoToken      = "a1e1161ecc1b38",
-    [string[]]$BlockedCountries = @("HK", "CN", "RU", "IR", "KP", "SY", "CU", "BY", "MM", "VE")
+    [string[]]$BlockedCountries = @("HK", "CN", "RU", "IR", "KP", "SY", "CU", "BY", "MM", "VE"),
+    [switch]$ProxyOnly,
+    [switch]$SystemProxy,
+    [int]$MixedPort           = 10808
 )
 
 $ErrorActionPreference = "Stop"
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 # ── Color Output Helpers ──────────────────────────────────────────────────────
 function Write-Info    { param($m) Write-Host "[*] $m" -ForegroundColor Cyan    }
@@ -28,77 +33,148 @@ function Write-Ok      { param($m) Write-Host "[+] $m" -ForegroundColor Green   
 function Write-Warn    { param($m) Write-Host "[!] $m" -ForegroundColor Yellow  }
 function Write-Err     { param($m) Write-Host "[-] $m" -ForegroundColor Red     }
 
-# ── Auto-Elevation to Administrator ──────────────────────────────────────────
+# ── Auto-Elevation to Administrator (Required for TUN Mode) ───────────────────
 $isAdmin = ([Security.Principal.WindowsPrincipal](
     [Security.Principal.WindowsIdentity]::GetCurrent()
 )).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-if (-not $isAdmin) {
+if (-not $ProxyOnly -and -not $isAdmin) {
     Write-Warn "Cluster TUN mode requires Administrator privileges."
     Write-Info "Re-launching elevated (UAC prompt)..."
     $argList = "-ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    if ($ConfigFolder) { $argList += " -ConfigFolder `"$ConfigFolder`"" }
-    if ($SingBoxPath)  { $argList += " -SingBoxPath `"$SingBoxPath`"" }
+    if ($ConfigFolder)               { $argList += " -ConfigFolder `"$ConfigFolder`"" }
+    if ($SingBoxPath)                { $argList += " -SingBoxPath `"$SingBoxPath`"" }
+    if ($CustomerSubnets.Count -gt 0){ $argList += " -CustomerSubnets @(" + (($CustomerSubnets | ForEach-Object { "'$_'" }) -join ",") + ")" }
+    if ($CorpDomains.Count -gt 0)    { $argList += " -CorpDomains @(" + (($CorpDomains | ForEach-Object { "'$_'" }) -join ",") + ")" }
+    if ($SystemProxy)                { $argList += " -SystemProxy" }
+    $argList += " -MixedPort $MixedPort"
     Start-Process powershell -Verb RunAs -ArgumentList $argList
     exit 0
 }
 
 # ── State Tracking for Clean Exit ─────────────────────────────────────────────
 $CreatedFirewallRules = New-Object System.Collections.Generic.List[string]
-$CreatedRoutes        = New-Object System.Collections.Generic.List[object]
+$CreatedRoutes        = New-Object System.Collections.Generic.List[string]
+$RouteTrackFile       = Join-Path $PSScriptRoot "_cluster_routes.txt"
+$TempConfigPath       = Join-Path $PSScriptRoot "_singbox_cluster_run.json"
 $SingBoxProcess       = $null
-$TempConfigPath       = ""
+$AppliedSystemProxy   = $false
+$PrevProxyState       = $null
+$CleanupExecuted      = $false
+
+# ── Fast Route Cleanup (Preserves Customer VPN Gateway Routes) ────────────────
+function Clear-TrackedRoutesFast {
+    param([string[]]$ExcludeCidrs = @())
+    $ipsToDelete = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($ip in $CreatedRoutes) {
+        if ($ip) { $null = $ipsToDelete.Add($ip) }
+    }
+    if (Test-Path $RouteTrackFile) {
+        try {
+            foreach ($line in (Get-Content $RouteTrackFile -ErrorAction SilentlyContinue)) {
+                $clean = $line.Trim()
+                if ($clean) { $null = $ipsToDelete.Add($clean) }
+            }
+        } catch {}
+    }
+
+    if ($ipsToDelete.Count -gt 0) {
+        $excludeSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($ex in $ExcludeCidrs) {
+            if ($ex -match '^(.+?)/32$') { $null = $excludeSet.Add($matches[1]) }
+        }
+        foreach ($ip in $ipsToDelete) {
+            if (-not $excludeSet.Contains($ip)) {
+                & route.exe delete $ip 2>$null | Out-Null
+            }
+        }
+    }
+
+    $CreatedRoutes.Clear()
+    if (Test-Path $RouteTrackFile) {
+        Remove-Item $RouteTrackFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ── WinINet Notification Helper (Only used if -SystemProxy is active) ─────────
+function Set-WindowsSystemProxyState {
+    param([bool]$Enable, [string]$Server = "", [string]$Bypass = "")
+    $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    try {
+        Set-ItemProperty -Path $regPath -Name ProxyEnable -Value ($(if ($Enable) { 1 } else { 0 })) -ErrorAction SilentlyContinue
+        if ($Enable) {
+            Set-ItemProperty -Path $regPath -Name ProxyServer -Value $Server -ErrorAction SilentlyContinue
+            if ($Bypass) { Set-ItemProperty -Path $regPath -Name ProxyOverride -Value $Bypass -ErrorAction SilentlyContinue }
+        }
+        if (-not ("WinInetNative" -as [type])) {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class WinInetNative {
+    [DllImport("wininet.dll", SetLastError = true)]
+    public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+}
+"@ -ErrorAction SilentlyContinue
+        }
+        if ("WinInetNative" -as [type]) {
+            [WinInetNative]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+            [WinInetNative]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+        }
+    } catch {}
+}
 
 # ── Cleanup Routine ───────────────────────────────────────────────────────────
 function Invoke-Cleanup {
+    if ($script:CleanupExecuted) { return }
+    $script:CleanupExecuted = $true
+
     Write-Host ""
     Write-Info "Stopping cluster... Restoring network..."
 
     # 1. Terminate sing-box (instantly tears down TUN adapter & Windows routes)
-    if ($SingBoxProcess -ne $null -and -not $SingBoxProcess.HasExited) {
+    if ($script:SingBoxProcess -ne $null -and -not $script:SingBoxProcess.HasExited) {
         try {
-            $SingBoxProcess.Kill()
-            $SingBoxProcess.WaitForExit(3000)
+            $script:SingBoxProcess.Kill()
+            $script:SingBoxProcess.WaitForExit(3000) | Out-Null
             Write-Ok "sing-box stopped (TUN adapter removed)."
         } catch {}
     }
     Get-Process -Name "sing-box" -ErrorAction SilentlyContinue |
         ForEach-Object { try { $_.Kill() } catch {} }
 
-    # 2. Remove all bypass routes added for cluster servers
-    if ($CreatedRoutes.Count -gt 0) {
-        Write-Info "Removing $($CreatedRoutes.Count) cluster bypass route(s)..."
-        foreach ($r in $CreatedRoutes) {
-            try {
-                Remove-NetRoute -DestinationPrefix $r.Prefix -NextHop $r.Gateway `
-                                -Confirm:$false -ErrorAction SilentlyContinue
-            } catch {}
-        }
-        Write-Ok "  Bypass routes cleared."
-    }
-
-    # Also perform safety bulk sweep for any lingering /32 routes pointing to gateway
-    if ($gw -and $gw.Gateway) {
-        try {
-            Get-NetRoute -DestinationPrefix "*/32" -NextHop $gw.Gateway -RouteMetric 5 -ErrorAction SilentlyContinue |
-                Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-        } catch {}
+    # 2. Fast-scrub only our tracked cluster /32 routes (Customer VPN gateway routes untouched)
+    $countBefore = $CreatedRoutes.Count
+    Clear-TrackedRoutesFast
+    if ($countBefore -gt 0) {
+        Write-Ok "  Cleared $countBefore cluster bypass route(s)."
     }
 
     # 3. Remove all MultipVPN firewall rules in bulk
-    try {
-        Remove-NetFirewallRule -DisplayName "MultipVPN*" -ErrorAction SilentlyContinue
-        Write-Ok "  Firewall rules cleared."
-    } catch {}
+    if ($isAdmin) {
+        try {
+            Remove-NetFirewallRule -DisplayName "MultipVPN*" -ErrorAction SilentlyContinue
+            Write-Ok "  Firewall rules cleared."
+        } catch {}
+    }
 
     # 4. Remove temp config file
     if ($TempConfigPath -ne "" -and (Test-Path $TempConfigPath)) {
         Remove-Item $TempConfigPath -Force -ErrorAction SilentlyContinue
     }
 
-    # 5. Flush DNS and ensure system proxy is disabled
+    # 5. Restore System Proxy only if this session modified it
+    if ($script:AppliedSystemProxy) {
+        if ($script:PrevProxyState -and $script:PrevProxyState.Enable -eq 1) {
+            Set-WindowsSystemProxyState -Enable $true -Server $script:PrevProxyState.Server -Bypass $script:PrevProxyState.Override
+        } else {
+            Set-WindowsSystemProxyState -Enable $false
+        }
+        Write-Ok "  System proxy restored."
+    }
+
+    # 6. Flush DNS cache
     try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
-    try { Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -Name ProxyEnable -Value 0 -ErrorAction SilentlyContinue } catch {}
 
     Write-Ok "Network completely restored. Customer VPN is intact."
 }
@@ -123,40 +199,174 @@ function Find-SingBox {
     return $null
 }
 
-# ── Detect Physical Wi-Fi/Ethernet Gateway (Bypasses Customer VPN) ─────────────
+# ── Detect Physical Wi-Fi/Ethernet Gateway & DNS (Bypasses Customer VPN) ──────
 function Get-PhysicalGateway {
-    $skipWords = @("vmware","virtual","tap","loopback","tunnel","pangp","anyconnect","fortinet","cisco","outline")
+    $skipWords = @("vmware","virtual","tap","loopback","tunnel","pangp","anyconnect","fortinet","cisco","outline","sing-tun","wintun","wireguard","nordlynx","tailscale","multip")
     $routes = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
               Sort-Object RouteMetric
     foreach ($r in $routes) {
         if ($r.NextHop -eq "0.0.0.0") { continue }
         $adapter = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -ErrorAction SilentlyContinue
         if (-not $adapter -or $adapter.Status -ne "Up") { continue }
-        $desc = $adapter.InterfaceDescription.ToLower()
+        $desc = "$($adapter.InterfaceDescription) $($adapter.Name)".ToLower()
         $skip = $false
         foreach ($w in $skipWords) { if ($desc -like "*$w*") { $skip = $true; break } }
         if (-not $skip) {
-            return @{ Gateway = $r.NextHop; IfIndex = $r.InterfaceIndex; Name = $adapter.Name }
+            $dnsList = @((Get-DnsClientServerAddress -InterfaceIndex $r.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses |
+                         Where-Object { $_ -and $_ -ne "0.0.0.0" -and $_ -notlike "127.*" -and $_ -notlike "169.254.*" -and $_ -notlike "172.19.0.*" })
+            return @{ Gateway = $r.NextHop; IfIndex = $r.InterfaceIndex; Name = $adapter.Name; DnsServers = $dnsList }
         }
     }
     $best = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
             Sort-Object RouteMetric | Select-Object -First 1
     if ($best -and $best.NextHop -ne "0.0.0.0") {
         $adapter = Get-NetAdapter -InterfaceIndex $best.InterfaceIndex -ErrorAction SilentlyContinue
-        return @{ Gateway = $best.NextHop; IfIndex = $best.InterfaceIndex; Name = $adapter.Name }
+        $dnsList = @((Get-DnsClientServerAddress -InterfaceIndex $best.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses |
+                     Where-Object { $_ -and $_ -ne "0.0.0.0" -and $_ -notlike "127.*" -and $_ -notlike "169.254.*" -and $_ -notlike "172.19.0.*" })
+        return @{ Gateway = $best.NextHop; IfIndex = $best.InterfaceIndex; Name = $adapter.Name; DnsServers = $dnsList }
     }
     return $null
 }
 
+# ── Dynamic Customer VPN State Inspector (FortiClient / AnyConnect / PANGP) ───
+function Get-EnterpriseVpnState {
+    param(
+        $PhysicalGw,
+        [System.Collections.Generic.HashSet[string]]$ProxyServerIPs
+    )
+
+    $vpnAdapters = [System.Collections.Generic.List[string]]::new()
+    $subnets     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $gwCidrs     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $dnsServers  = [System.Collections.Generic.List[string]]::new()
+    $suffixes    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $hasFullTunnel = $false
+
+    $matchPattern = 'fortinet|fortissl|cisco|anyconnect|pangp|globalprotect|pulse|juniper|sonicwall|check point|checkpoint'
+    $allAdapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+        $_.Status -eq "Up" -and (
+            $_.InterfaceDescription -match $matchPattern -or $_.Name -match $matchPattern
+        )
+    }
+
+    foreach ($ad in $allAdapters) {
+        $ifIdx = $ad.InterfaceIndex
+        $ipIf = Get-NetIPInterface -InterfaceIndex $ifIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        if ($ipIf -and $ipIf.ConnectionState -ne "Connected") { continue }
+
+        $vpnAdapters.Add($ad.Name)
+
+        # Collect active routes pushed onto this VPN adapter (both private & customer public blocks)
+        $ifRoutes = Get-NetRoute -InterfaceIndex $ifIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        foreach ($rt in $ifRoutes) {
+            $pfx = $rt.DestinationPrefix
+            if ($pfx -eq "0.0.0.0/0") {
+                $hasFullTunnel = $true
+                continue
+            }
+            if ($pfx -like "169.254.*" -or $pfx -like "224.*" -or $pfx -eq "255.255.255.255/32" -or $pfx -like "127.*") { continue }
+            # Skip local link-broadcast or interface host self-/32 (RouteMetric 256 & NextHop 0.0.0.0)
+            if ($pfx -like "*/32" -and $rt.NextHop -eq "0.0.0.0" -and $rt.RouteMetric -eq 256) { continue }
+            $null = $subnets.Add($pfx)
+        }
+
+        # Collect valid internal corporate DNS servers assigned by customer VPN
+        $adDns = (Get-DnsClientServerAddress -InterfaceIndex $ifIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+        foreach ($d in $adDns) {
+            if ($d -and $d -ne "0.0.0.0" -and $d -notlike "127.*" -and $d -notlike "169.254.*" -and $d -notlike "172.19.0.*") {
+                if (-not $dnsServers.Contains($d)) { $dnsServers.Add($d) }
+            }
+        }
+
+        # Collect connection-specific DNS suffixes
+        $dnsClient = Get-DnsClient -InterfaceIndex $ifIdx -ErrorAction SilentlyContinue
+        if ($dnsClient) {
+            if ($dnsClient.ConnectionSpecificSuffix) {
+                $s = $dnsClient.ConnectionSpecificSuffix.Trim().TrimStart('.')
+                if ($s) { $null = $suffixes.Add(".$s") }
+            }
+            foreach ($sItem in $dnsClient.ConnectionSpecificSuffixSearchList) {
+                $s = $sItem.Trim().TrimStart('.')
+                if ($s) { $null = $suffixes.Add(".$s") }
+            }
+        }
+    }
+
+    # Check Windows NRPT split-DNS namespaces if a customer VPN is connected
+    if ($vpnAdapters.Count -gt 0) {
+        try {
+            $nrpt = Get-DnsClientNrptPolicy -ErrorAction SilentlyContinue
+            foreach ($rule in $nrpt) {
+                if ($rule.Namespace) {
+                    $ns = $rule.Namespace.Trim()
+                    if ($ns -and $ns -ne ".") {
+                        if (-not $ns.StartsWith(".")) { $ns = ".$ns" }
+                        $null = $suffixes.Add($ns)
+                    }
+                }
+            }
+        } catch {}
+
+        # Also inspect physical adapter for any active /32 VPN Gateway bypass routes (not our own proxy IPs)
+        if ($PhysicalGw) {
+            $physHostRoutes = Get-NetRoute -InterfaceIndex $PhysicalGw.IfIndex -AddressFamily IPv4 -DestinationPrefix "*/32" -ErrorAction SilentlyContinue
+            foreach ($pr in $physHostRoutes) {
+                if ($pr.NextHop -eq $PhysicalGw.Gateway) {
+                    $rawIp = $pr.DestinationPrefix -replace '/32$',''
+                    if ($ProxyServerIPs -and $ProxyServerIPs.Contains($rawIp)) { continue }
+                    if ($rawIp -ne $PhysicalGw.Gateway -and $rawIp -notlike "127.*" -and $rawIp -notlike "224.*") {
+                        $null = $gwCidrs.Add($pr.DestinationPrefix)
+                    }
+                }
+            }
+        }
+    }
+
+    $sortedAdapters = @($vpnAdapters | Sort-Object)
+    $sortedSubnets  = @($subnets | Sort-Object)
+    $sortedGw       = @($gwCidrs | Sort-Object)
+    $sortedDns      = @($dnsServers | Sort-Object)
+    $sortedSuffixes = @($suffixes | Sort-Object)
+
+    $sig = (@(
+        ($sortedAdapters -join ","),
+        ($sortedSubnets -join ","),
+        ($sortedGw -join ","),
+        ($sortedDns -join ","),
+        ($sortedSuffixes -join ","),
+        $hasFullTunnel
+    ) -join "|")
+
+    return [pscustomobject]@{
+        Active         = ($vpnAdapters.Count -gt 0)
+        PrimaryAdapter = if ($vpnAdapters.Count -gt 0) { $vpnAdapters[0] } else { "" }
+        Adapters       = $sortedAdapters
+        Subnets        = $sortedSubnets
+        GatewayCidrs   = $sortedGw
+        DnsServers     = $sortedDns
+        Suffixes       = $sortedSuffixes
+        HasFullTunnel  = $hasFullTunnel
+        Signature      = $sig
+    }
+}
+
 # ── Route & Firewall Helpers ──────────────────────────────────────────────────
-function Add-TrackedRoute {
-    param($Prefix, $Gateway, $IfIndex, $Metric = 5)
+function Add-TrackedRoutesBatch {
+    param([string[]]$IPs, [string]$Gateway, [int]$IfIndex, [int]$Metric = 5)
+    if (-not $IPs -or $IPs.Count -eq 0) { return }
+
+    foreach ($ip in $IPs) {
+        if (-not $ip) { continue }
+        # Native route.exe change/add is >50x faster than PowerShell New-NetRoute WMI loop
+        & route.exe delete $ip 2>$null | Out-Null
+        & route.exe add $ip mask 255.255.255.255 $Gateway metric $Metric if $IfIndex 2>$null | Out-Null
+        if (-not $CreatedRoutes.Contains($ip)) {
+            $CreatedRoutes.Add($ip)
+        }
+    }
+
     try {
-        Remove-NetRoute -DestinationPrefix $Prefix -NextHop $Gateway -Confirm:$false -ErrorAction SilentlyContinue
-        New-NetRoute -DestinationPrefix $Prefix -NextHop $Gateway `
-                     -InterfaceIndex $IfIndex -RouteMetric $Metric `
-                     -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-        $CreatedRoutes.Add([pscustomobject]@{ Prefix = $Prefix; Gateway = $Gateway })
+        [System.IO.File]::WriteAllLines($RouteTrackFile, @($CreatedRoutes), (New-Object System.Text.UTF8Encoding $false))
     } catch {}
 }
 
@@ -355,7 +565,7 @@ Write-Host "   Antigravity Geo-Filter * Auto Lowest-Ping * Tor-Style Multipath" 
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# 1. Locate sing-box binary
+# 1. Locate sing-box binary & clear any orphaned state from interrupted runs
 $singBoxExe = Find-SingBox
 if (-not $singBoxExe) {
     Write-Err "sing-box.exe not found! Please place sing-box.exe in project folder."
@@ -363,12 +573,23 @@ if (-not $singBoxExe) {
 }
 Write-Ok "sing-box engine: $singBoxExe"
 
+$staleProcs = Get-Process -Name "sing-box" -ErrorAction SilentlyContinue
+if ($staleProcs) {
+    Write-Warn "Found leftover sing-box process from an earlier run -- stopping it cleanly..."
+    $staleProcs | ForEach-Object { try { $_.Kill(); $_.WaitForExit(2000) | Out-Null } catch {} }
+}
+Clear-TrackedRoutesFast
+if ($isAdmin) {
+    Remove-NetFirewallRule -DisplayName "MultipVPN*" -ErrorAction SilentlyContinue
+}
+
 # 2. Find and inspect all JSON config files in the target directory
 Write-Info "Scanning for VPN configuration files in: $ConfigFolder"
 $jsonFiles = Get-ChildItem -Path $ConfigFolder -Filter "*.json" |
              Where-Object { 
                  $_.Name -notlike "_singbox*" -and 
                  $_.Name -notlike "_geo*" -and 
+                 $_.Name -notlike "_cluster*" -and 
                  $_.Name -notlike "*.example.json" -and 
                  $_.Name -notlike "normal_config*.json" 
              }
@@ -554,290 +775,453 @@ if ($approvedNodes.Count -eq 0) {
     exit 1
 }
 
-# 6. Detect Physical Gateway (Wi-Fi/Ethernet) to bypass Customer VPN
+# 6. Detect Physical Gateway (Wi-Fi/Ethernet) & Live Customer VPN State
 Write-Info "Detecting physical gateway (bypasses FortiClient / AnyConnect)..."
 $gw = Get-PhysicalGateway
 if (-not $gw) {
     Write-Err "Could not identify physical gateway. Check your internet connection."
     exit 1
 }
-Write-Ok "Physical Gateway: $($gw.Gateway) on $($gw.Name) (idx=$($gw.IfIndex))"
+$wifiDnsText = if ($gw.DnsServers.Count -gt 0) { " | DNS: $($gw.DnsServers -join ', ')" } else { "" }
+Write-Ok "Physical Gateway: $($gw.Gateway) on '$($gw.Name)' (idx=$($gw.IfIndex)$wifiDnsText)"
 
-# 7. Add static host routes for all approved cluster server IPs
-Write-Info "Adding bypass routes for all approved cluster nodes..."
-foreach ($ip in $allowedServerIPs) {
-    Add-TrackedRoute -Prefix "$ip/32" -Gateway $gw.Gateway -IfIndex $gw.IfIndex
-}
-Write-Ok "All approved cluster traffic routed directly to physical Wi-Fi (Customer VPN safe)."
-
-# 8. Add firewall rules
-Add-TrackedFwRule -Name "MultipVPN-Cluster-Out" -Direction Outbound -Protocol TCP
-Add-TrackedFwRule -Name "MultipVPN-Cluster-UDP" -Direction Outbound -Protocol UDP
-
-# 9. Build Tor-style Multi-Tier Cluster Outbounds (Approved Nodes Only)
-$allNodeTags   = @($approvedNodes | ForEach-Object { $_.tag })
-$hyTags        = @($approvedNodes | Where-Object { $_.type -eq "hysteria2" } | ForEach-Object { $_.tag })
-$vlessTags     = @($approvedNodes | Where-Object { $_.type -eq "vless" } | ForEach-Object { $_.tag })
-$vmessTrojan   = @($approvedNodes | Where-Object { $_.type -in @("vmess", "trojan", "shadowsocks") } | ForEach-Object { $_.tag })
-
-$clusterGroups = [System.Collections.Generic.List[object]]::new()
-
-# Group 1: Master Selector (Defaults to Lowest-Ping Cluster)
-$mainSelectorList = [System.Collections.Generic.List[string]]::new()
-$mainSelectorList.Add("⚡ Cluster - Auto Lowest Ping")
-if ($hyTags.Count -gt 0)      { $mainSelectorList.Add("🚀 Hysteria2 Turbo Pool") }
-if ($vlessTags.Count -gt 0)   { $mainSelectorList.Add("🛡️ VLESS Reality Stealth Pool") }
-if ($vmessTrojan.Count -gt 0) { $mainSelectorList.Add("🌐 Standard Proxy Pool") }
-$mainSelectorList.Add("⚙️ Manual Node Select")
-
-$clusterGroups.Add([pscustomobject]@{
-    type                        = "selector"
-    tag                         = "proxy"
-    outbounds                   = @($mainSelectorList)
-    interrupt_exist_connections = $false
-})
-
-# Group 2: Global Auto Lowest Ping (Tests all approved nodes continuously)
-$clusterGroups.Add([pscustomobject]@{
-    type                        = "urltest"
-    tag                         = "⚡ Cluster - Auto Lowest Ping"
-    outbounds                   = @($allNodeTags)
-    url                         = "https://www.gstatic.com/generate_204"
-    interval                    = "1m"
-    tolerance                   = 25
-    interrupt_exist_connections = $false
-})
-
-# Group 3: Hysteria2 Turbo Pool (UDP high throughput & lowest gaming latency)
-if ($hyTags.Count -gt 0) {
-    $clusterGroups.Add([pscustomobject]@{
-        type                        = "urltest"
-        tag                         = "🚀 Hysteria2 Turbo Pool"
-        outbounds                   = @($hyTags)
-        url                         = "https://www.gstatic.com/generate_204"
-        interval                    = "1m"
-        tolerance                   = 25
-        interrupt_exist_connections = $false
-    })
-}
-
-# Group 4: VLESS Reality Stealth Pool (Anti-blocking Reality nodes)
-if ($vlessTags.Count -gt 0) {
-    $clusterGroups.Add([pscustomobject]@{
-        type                        = "urltest"
-        tag                         = "🛡️ VLESS Reality Stealth Pool"
-        outbounds                   = @($vlessTags)
-        url                         = "https://www.gstatic.com/generate_204"
-        interval                    = "1m"
-        tolerance                   = 25
-        interrupt_exist_connections = $false
-    })
-}
-
-# Group 5: Standard Proxy Pool (VMess / Trojan / Shadowsocks)
-if ($vmessTrojan.Count -gt 0) {
-    $clusterGroups.Add([pscustomobject]@{
-        type                        = "urltest"
-        tag                         = "🌐 Standard Proxy Pool"
-        outbounds                   = @($vmessTrojan)
-        url                         = "https://www.gstatic.com/generate_204"
-        interval                    = "1m"
-        tolerance                   = 25
-        interrupt_exist_connections = $false
-    })
-}
-
-# Group 6: Manual Node Select (fallback)
-$clusterGroups.Add([pscustomobject]@{
-    type      = "selector"
-    tag       = "⚙️ Manual Node Select"
-    outbounds = @($allNodeTags)
-})
-
-# Group 7: Direct & Block
-$clusterGroups.Add([pscustomobject]@{ type = "direct"; tag = "direct" })
-$clusterGroups.Add([pscustomobject]@{ type = "block";  tag = "block" })
-
-# Assemble full outbounds array
-$fullOutbounds = [System.Collections.Generic.List[object]]::new()
-foreach ($grp in $clusterGroups)   { $fullOutbounds.Add($grp) }
-foreach ($node in $approvedNodes)  { $fullOutbounds.Add($node) }
-
-# 10. Split-Tunnel List: Exclude Customer Subnets + Antigravity Localhost + Approved Server IPs
-$standardPrivateSubnets = @(
-    "127.0.0.0/8",         # Localhost loopback (Antigravity IDE, local agent IPC, language servers)
-    "10.0.0.0/8",          # RFC 1918 Private / FortiClient / AnyConnect
-    "172.16.0.0/12",       # RFC 1918 Private / Customer VPN
-    "192.168.0.0/16",      # RFC 1918 Local LAN / Wi-Fi Gateway
-    "169.254.0.0/16",      # Link-local / APIPA
-    "224.0.0.0/4",         # Multicast
-    "255.255.255.255/32"   # Broadcast
-)
-
-$excludeList = [System.Collections.Generic.List[string]]::new()
-foreach ($p in $standardPrivateSubnets) {
-    if (-not $excludeList.Contains($p)) { $excludeList.Add($p) }
-}
-foreach ($sub in $CustomerSubnets) {
-    if (-not $excludeList.Contains($sub)) { $excludeList.Add($sub) }
-}
-foreach ($ip in $allowedServerIPs) {
-    $cidr = "$ip/32"
-    if (-not $excludeList.Contains($cidr)) { $excludeList.Add($cidr) }
-}
-
-# 11. DNS Configuration with Hosts Predefined & Rock-Solid DoH Remote DNS
-$hasHosts = ($hostsMap.PSObject.Properties | Measure-Object).Count -gt 0
-$dnsServers = [System.Collections.Generic.List[object]]::new()
-
-# Tier 1: Predefined hosts for VPN endpoints (0ms instant resolution, avoids DNS loops)
-if ($hasHosts) {
-    $dnsServers.Add([pscustomobject]@{
-        tag        = "dns-hosts"
-        type       = "hosts"
-        predefined = $hostsMap
-    })
-}
-
-# Tier 2: Primary Remote DoH DNS (via Cloudflare 1.1.1.1 over HTTPS port 443 over proxy - NEVER blocked by proxy nodes)
-$dnsServers.Add([pscustomobject]@{
-    tag         = "dns-remote-doh"
-    type        = "https"
-    server      = "1.1.1.1"
-    server_port = 443
-    path        = "/dns-query"
-    detour      = "proxy"
-})
-
-# Tier 3: Secondary Remote DoH DNS (via Google 8.8.8.8 over HTTPS port 443 over proxy)
-$dnsServers.Add([pscustomobject]@{
-    tag         = "dns-google-doh"
-    type        = "https"
-    server      = "8.8.8.8"
-    server_port = 443
-    path        = "/dns-query"
-    detour      = "proxy"
-})
-
-# Tier 4: Local physical adapter DNS (for private LAN, Customer VPN, and corporate domains)
-$dnsServers.Add([pscustomobject]@{
-    tag  = "dns-local"
-    type = "local"
-})
-
-$dnsRules = [System.Collections.Generic.List[object]]::new()
-if ($hasHosts) {
-    $hostDomains = @($hostsMap.PSObject.Properties | ForEach-Object { $_.Name })
-    $dnsRules.Add([pscustomobject]@{ domain = $hostDomains; server = "dns-hosts" })
-}
-
-# Route corporate Microsoft, Palo Alto Cortex Traps, customer VPN, and LAN queries to local DNS
-$dnsRules.Add([pscustomobject]@{
-    domain_suffix = @(
-        ".sharepoint.com",
-        ".paloaltonetworks.com",
-        ".traps.paloaltonetworks.com",
-        ".microsoft.com",
-        ".office.com",
-        ".office365.com",
-        ".msftauth.net",
-        ".live.com",
-        ".local",
-        ".lan",
-        ".home",
-        ".internal",
-        ".corp",
-        "in-addr.arpa",
-        "ip6.arpa"
-    )
-    server = "dns-local"
-})
-
-# 12. Transparent TUN Inbound
-$tunInbound = [pscustomobject]@{
-    type                  = "tun"
-    tag                   = "tun-in"
-    address               = @("172.19.0.1/30")
-    auto_route            = $true
-    strict_route          = $false
-    stack                 = "mixed"
-    route_exclude_address = @($excludeList)
-}
-
-# 13. Routing Rules (Antigravity & Customer VPN Safe)
-$routeBlock = [pscustomobject]@{
-    default_domain_resolver = "dns-local"
-    rules = @(
-        [pscustomobject]@{ action = "sniff" },
-        [pscustomobject]@{ protocol = "dns"; action = "hijack-dns" },
-        # Bypass corporate endpoint security and Palo Alto Traps
-        [pscustomobject]@{
-            domain_suffix = @(
-                ".paloaltonetworks.com",
-                ".traps.paloaltonetworks.com"
-            )
-            outbound = "direct"
-        },
-        # Bypass all private IP traffic (Localhost 127.0.0.1, LAN, Customer VPN)
-        [pscustomobject]@{ ip_is_private = $true; outbound = "direct" },
-        # Bypass all explicit subnets & VPN server IPs
-        [pscustomobject]@{
-            ip_cidr  = @($excludeList)
-            outbound = "direct"
-        }
-    )
-    auto_detect_interface = $true
-    final                 = "proxy"
-}
-
-$finalClusterConfig = [pscustomobject]@{
-    log = [pscustomobject]@{ level = "warn"; timestamp = $true }
-    dns = [pscustomobject]@{
-        servers = @($dnsServers)
-        rules   = @($dnsRules)
-        final   = "dns-remote-doh"
+$vpnState = Get-EnterpriseVpnState -PhysicalGw $gw -ProxyServerIPs $allowedServerIPs
+if ($vpnState.Active) {
+    Write-Ok "Customer VPN Detected: $($vpnState.Adapters -join ', ')"
+    if ($vpnState.Subnets.Count -gt 0)    { Write-Host "   • Bypassed VPN Subnets : $($vpnState.Subnets -join ', ')" -ForegroundColor Cyan }
+    if ($vpnState.GatewayCidrs.Count -gt 0) { Write-Host "   • Bypassed Gateway IP  : $($vpnState.GatewayCidrs -join ', ')" -ForegroundColor Cyan }
+    if ($vpnState.DnsServers.Count -gt 0) { Write-Host "   • Corporate DNS Server : $($vpnState.DnsServers -join ', ')" -ForegroundColor Cyan }
+    if ($vpnState.HasFullTunnel) {
+        Write-Warn "FortiClient/Customer VPN is pushing Full-Tunnel (0.0.0.0/0)."
+        Write-Warn "If FortiClient enforces strict exclusive routing and drops TUN, run: .\connect-cluster.ps1 -ProxyOnly -SystemProxy"
     }
-    inbounds  = @($tunInbound)
-    outbounds = @($fullOutbounds)
-    route     = $routeBlock
+} else {
+    Write-Info "No active Customer VPN detected right now (Live hot-reload watcher is armed for FortiClient/AnyConnect)."
 }
 
-$TempConfigPath = Join-Path $PSScriptRoot "_singbox_cluster_run.json"
-$utf8NoBom = New-Object System.Text.UTF8Encoding $false
-$json = $finalClusterConfig | ConvertTo-Json -Depth 20
-[System.IO.File]::WriteAllText($TempConfigPath, $json, $utf8NoBom)
-Write-Ok "Cluster configuration synthesized ($($fullOutbounds.Count) total targets)."
+# 7. Add fast static host routes for approved cluster server IPs (preserves Customer VPN gateway route)
+if ($isAdmin -and -not $ProxyOnly) {
+    Write-Info "Adding bypass routes for $($allowedServerIPs.Count) cluster node(s) on '$($gw.Name)'..."
+    Add-TrackedRoutesBatch -IPs @($allowedServerIPs) -Gateway $gw.Gateway -IfIndex $gw.IfIndex
+    Write-Ok "All cluster endpoints bound to '$($gw.Name)' (FortiClient-safe, zero TUN route bloat)."
 
-# 14. Launch sing-box Cluster Engine
+    # 8. Add scoped firewall rules
+    Add-TrackedFwRule -Name "MultipVPN-Cluster-Out" -Direction Outbound -Protocol TCP
+    Add-TrackedFwRule -Name "MultipVPN-Cluster-UDP" -Direction Outbound -Protocol UDP
+} elseif ($ProxyOnly) {
+    Write-Info "Proxy-Only Mode active: No TUN adapter or routing table changes will be made (100% FortiClient isolated)."
+}
+
+# ── Helper: Synthesize Sing-Box Cluster JSON ──────────────────────────────────
+function New-SingBoxClusterConfig {
+    param(
+        $PhysicalGw,
+        $EnterpriseVpn,
+        [System.Collections.Generic.List[object]]$Nodes,
+        $HostsTable,
+        [string[]]$UserCustomerSubnets,
+        [string[]]$ExtraCorpDomains,
+        [bool]$UseProxyOnly,
+        [int]$LocalMixedPort,
+        [string]$OutConfigPath
+    )
+
+    # Bind every proxy node explicitly to Physical Wi-Fi/Ethernet so Customer VPN (Metric 1) never hijacks them
+    $boundNodes = [System.Collections.Generic.List[object]]::new()
+    foreach ($n in $Nodes) {
+        $clone = $n.PSObject.Copy()
+        $clone | Add-Member -MemberType NoteProperty -Name "bind_interface" -Value $PhysicalGw.Name -Force
+        $boundNodes.Add($clone)
+    }
+
+    $allNodeTags = @($boundNodes | ForEach-Object { $_.tag })
+    $hyTags      = @($boundNodes | Where-Object { $_.type -eq "hysteria2" } | ForEach-Object { $_.tag })
+    $vlessTags   = @($boundNodes | Where-Object { $_.type -eq "vless" } | ForEach-Object { $_.tag })
+    $vmessTrojan = @($boundNodes | Where-Object { $_.type -in @("vmess", "trojan", "shadowsocks") } | ForEach-Object { $_.tag })
+
+    $clusterGroups = [System.Collections.Generic.List[object]]::new()
+
+    $mainSelectorList = [System.Collections.Generic.List[string]]::new()
+    $mainSelectorList.Add("⚡ Cluster - Auto Lowest Ping")
+    if ($hyTags.Count -gt 0)      { $mainSelectorList.Add("🚀 Hysteria2 Turbo Pool") }
+    if ($vlessTags.Count -gt 0)   { $mainSelectorList.Add("🛡️ VLESS Reality Stealth Pool") }
+    if ($vmessTrojan.Count -gt 0) { $mainSelectorList.Add("🌐 Standard Proxy Pool") }
+    $mainSelectorList.Add("⚙️ Manual Node Select")
+
+    $clusterGroups.Add([pscustomobject]@{
+        type                        = "selector"
+        tag                         = "proxy"
+        outbounds                   = @($mainSelectorList)
+        interrupt_exist_connections = $false
+    })
+
+    $clusterGroups.Add([pscustomobject]@{
+        type                        = "urltest"
+        tag                         = "⚡ Cluster - Auto Lowest Ping"
+        outbounds                   = @($allNodeTags)
+        url                         = "https://www.gstatic.com/generate_204"
+        interval                    = "1m"
+        tolerance                   = 25
+        interrupt_exist_connections = $false
+    })
+
+    if ($hyTags.Count -gt 0) {
+        $clusterGroups.Add([pscustomobject]@{
+            type                        = "urltest"
+            tag                         = "🚀 Hysteria2 Turbo Pool"
+            outbounds                   = @($hyTags)
+            url                         = "https://www.gstatic.com/generate_204"
+            interval                    = "1m"
+            tolerance                   = 25
+            interrupt_exist_connections = $false
+        })
+    }
+
+    if ($vlessTags.Count -gt 0) {
+        $clusterGroups.Add([pscustomobject]@{
+            type                        = "urltest"
+            tag                         = "🛡️ VLESS Reality Stealth Pool"
+            outbounds                   = @($vlessTags)
+            url                         = "https://www.gstatic.com/generate_204"
+            interval                    = "1m"
+            tolerance                   = 25
+            interrupt_exist_connections = $false
+        })
+    }
+
+    if ($vmessTrojan.Count -gt 0) {
+        $clusterGroups.Add([pscustomobject]@{
+            type                        = "urltest"
+            tag                         = "🌐 Standard Proxy Pool"
+            outbounds                   = @($vmessTrojan)
+            url                         = "https://www.gstatic.com/generate_204"
+            interval                    = "1m"
+            tolerance                   = 25
+            interrupt_exist_connections = $false
+        })
+    }
+
+    $clusterGroups.Add([pscustomobject]@{
+        type      = "selector"
+        tag       = "⚙️ Manual Node Select"
+        outbounds = @($allNodeTags)
+    })
+
+    # Direct Outbounds: Physical Wi-Fi Direct, Customer VPN Direct (when active), Standard OS Direct, Block
+    $clusterGroups.Add([pscustomobject]@{
+        type           = "direct"
+        tag            = "direct-wifi"
+        bind_interface = $PhysicalGw.Name
+    })
+    if ($EnterpriseVpn.Active) {
+        if ($EnterpriseVpn.Adapters.Count -eq 1 -and $EnterpriseVpn.PrimaryAdapter) {
+            $clusterGroups.Add([pscustomobject]@{
+                type           = "direct"
+                tag            = "direct-custvpn"
+                bind_interface = $EnterpriseVpn.PrimaryAdapter
+            })
+        } else {
+            $clusterGroups.Add([pscustomobject]@{
+                type = "direct"
+                tag  = "direct-custvpn"
+            })
+        }
+    }
+    $clusterGroups.Add([pscustomobject]@{ type = "direct"; tag = "direct" })
+    $clusterGroups.Add([pscustomobject]@{ type = "block";  tag = "block" })
+
+    $fullOutbounds = [System.Collections.Generic.List[object]]::new()
+    foreach ($grp in $clusterGroups) { $fullOutbounds.Add($grp) }
+    foreach ($bn  in $boundNodes)    { $fullOutbounds.Add($bn) }
+
+    # Clean TUN Split-Tunnel Exclusions (NO 99 /32 proxy IPs here -> eliminates 1,500-route fragmentation!)
+    $standardPrivateSubnets = @(
+        "127.0.0.0/8",         # Localhost loopback (Antigravity IDE, local agent IPC, language servers)
+        "10.0.0.0/8",          # RFC 1918 Private / FortiClient / AnyConnect
+        "172.16.0.0/12",       # RFC 1918 Private / Customer VPN
+        "192.168.0.0/16",      # RFC 1918 Local LAN / Wi-Fi Gateway
+        "169.254.0.0/16",      # Link-local / APIPA
+        "224.0.0.0/4",         # Multicast
+        "255.255.255.255/32"   # Broadcast
+    )
+
+    $tunExcludeList = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in $standardPrivateSubnets)          { if (-not $tunExcludeList.Contains($p))   { $tunExcludeList.Add($p) } }
+    foreach ($sub in $UserCustomerSubnets)           { if ($sub -and -not $tunExcludeList.Contains($sub)) { $tunExcludeList.Add($sub) } }
+    foreach ($dynSub in $EnterpriseVpn.Subnets)      { if ($dynSub -and -not $tunExcludeList.Contains($dynSub)) { $tunExcludeList.Add($dynSub) } }
+    foreach ($gwCidr in $EnterpriseVpn.GatewayCidrs) { if ($gwCidr -and -not $tunExcludeList.Contains($gwCidr)) { $tunExcludeList.Add($gwCidr) } }
+
+    # Executables for FortiClient, Cisco AnyConnect, and Palo Alto GlobalProtect (always bypass TUN/Proxy)
+    $vpnClientProcesses = @(
+        "FortiClient.exe", "FortiClientConsole.exe", "FortiClientSecurity.exe",
+        "FortiSSLVPNdaemon.exe", "FortiSSLVPNsys.exe", "FortiVPN.exe", "FortiTray.exe",
+        "FortiSettings.exe", "FortiAuth.exe", "FCAuth.exe", "AzureToken2.exe",
+        "FSSOMA.exe", "FortiWad.exe", "ipsec.exe", "scheduler.exe",
+        "vpnagent.exe", "vpnui.exe", "csc_ui.exe",
+        "PanGPA.exe", "PanGPS.exe"
+    )
+
+    # DNS Configuration
+    $hasHosts = ($HostsTable.PSObject.Properties | Measure-Object).Count -gt 0
+    $dnsServers = [System.Collections.Generic.List[object]]::new()
+
+    if ($hasHosts) {
+        $dnsServers.Add([pscustomobject]@{
+            tag        = "dns-hosts"
+            type       = "hosts"
+            predefined = $HostsTable
+        })
+    }
+
+    # Physical Wi-Fi DNS (queries router/ISP DNS directly out Physical Wi-Fi)
+    $hasWifiDns = ($PhysicalGw.DnsServers -and $PhysicalGw.DnsServers.Count -gt 0)
+    $wifiDnsTag = if ($hasWifiDns) { "dns-wifi" } else { "dns-local" }
+    if ($hasWifiDns) {
+        $dnsServers.Add([pscustomobject]@{
+            tag    = "dns-wifi"
+            type   = "udp"
+            server = $PhysicalGw.DnsServers[0]
+            detour = "direct-wifi"
+        })
+    }
+
+    # Customer VPN Internal DNS (active only when FortiClient/AnyConnect/PANGP provides DNS)
+    $hasCustDns = ($EnterpriseVpn.Active -and $EnterpriseVpn.DnsServers.Count -gt 0)
+    if ($hasCustDns) {
+        $dnsServers.Add([pscustomobject]@{
+            tag    = "dns-custvpn"
+            type   = "udp"
+            server = $EnterpriseVpn.DnsServers[0]
+            detour = "direct-custvpn"
+        })
+    }
+
+    # Remote DoH DNS over port 443 through cluster
+    $dnsServers.Add([pscustomobject]@{
+        tag         = "dns-remote-doh"
+        type        = "https"
+        server      = "1.1.1.1"
+        server_port = 443
+        path        = "/dns-query"
+        detour      = "proxy"
+    })
+    $dnsServers.Add([pscustomobject]@{
+        tag         = "dns-google-doh"
+        type        = "https"
+        server      = "8.8.8.8"
+        server_port = 443
+        path        = "/dns-query"
+        detour      = "proxy"
+    })
+    $dnsServers.Add([pscustomobject]@{
+        tag  = "dns-local"
+        type = "local"
+    })
+
+    $dnsRules = [System.Collections.Generic.List[object]]::new()
+    if ($hasHosts) {
+        $hostDomains = @($HostsTable.PSObject.Properties | ForEach-Object { $_.Name })
+        $dnsRules.Add([pscustomobject]@{ domain = $hostDomains; server = "dns-hosts" })
+    }
+    $dnsRules.Add([pscustomobject]@{ domain = @("localhost", "localhost.localdomain"); server = "dns-local" })
+    $dnsRules.Add([pscustomobject]@{ process_name = @($vpnClientProcesses); server = $wifiDnsTag })
+
+    $corpDnsSuffixes = [System.Collections.Generic.List[string]]::new()
+    foreach ($s in @(".local", ".lan", ".home", ".internal", ".corp", ".intranet", "in-addr.arpa", "ip6.arpa")) {
+        $corpDnsSuffixes.Add($s)
+    }
+    foreach ($s in $EnterpriseVpn.Suffixes) {
+        if ($s -and -not $corpDnsSuffixes.Contains($s)) { $corpDnsSuffixes.Add($s) }
+    }
+    foreach ($s in $ExtraCorpDomains) {
+        $norm = $s.Trim()
+        if ($norm -and -not $norm.StartsWith(".")) { $norm = ".$norm" }
+        if ($norm -and -not $corpDnsSuffixes.Contains($norm)) { $corpDnsSuffixes.Add($norm) }
+    }
+
+    if ($hasCustDns) {
+        $dnsRules.Add([pscustomobject]@{ domain_regex = @("^[^.]+$"); server = "dns-custvpn" })
+        $dnsRules.Add([pscustomobject]@{ domain_suffix = @($corpDnsSuffixes); server = "dns-custvpn" })
+    }
+
+    $localCloudSuffixes = @(
+        ".sharepoint.com", ".paloaltonetworks.com", ".traps.paloaltonetworks.com",
+        ".microsoft.com", ".office.com", ".office365.com", ".msftauth.net", ".live.com"
+    )
+    $localFallbackSuffixes = [System.Collections.Generic.List[string]]::new()
+    foreach ($s in $localCloudSuffixes) { $localFallbackSuffixes.Add($s) }
+    if (-not $hasCustDns) {
+        foreach ($s in $corpDnsSuffixes) {
+            if (-not $localFallbackSuffixes.Contains($s)) { $localFallbackSuffixes.Add($s) }
+        }
+    }
+    $dnsRules.Add([pscustomobject]@{ domain_suffix = @($localFallbackSuffixes); server = $wifiDnsTag })
+
+    # Inbounds
+    $inbounds = if ($UseProxyOnly) {
+        @(
+            [pscustomobject]@{
+                type        = "mixed"
+                tag         = "mixed-in"
+                listen      = "127.0.0.1"
+                listen_port = $LocalMixedPort
+            }
+        )
+    } else {
+        @(
+            [pscustomobject]@{
+                type                  = "tun"
+                tag                   = "tun-in"
+                address               = @("172.19.0.1/30")
+                auto_route            = $true
+                strict_route          = $false
+                stack                 = "mixed"
+                route_exclude_address = @($tunExcludeList)
+            }
+        )
+    }
+
+    # Route Rules
+    $routeRules = [System.Collections.Generic.List[object]]::new()
+    $routeRules.Add([pscustomobject]@{ action = "sniff" })
+    if (-not $UseProxyOnly) {
+        $routeRules.Add([pscustomobject]@{ protocol = "dns"; action = "hijack-dns" })
+    }
+    $routeRules.Add([pscustomobject]@{ process_name = @($vpnClientProcesses); outbound = "direct-wifi" })
+
+    if ($EnterpriseVpn.Active) {
+        if ($EnterpriseVpn.GatewayCidrs.Count -gt 0) {
+            $routeRules.Add([pscustomobject]@{ ip_cidr = @($EnterpriseVpn.GatewayCidrs); outbound = "direct-wifi" })
+        }
+        if ($EnterpriseVpn.Subnets.Count -gt 0) {
+            $routeRules.Add([pscustomobject]@{ ip_cidr = @($EnterpriseVpn.Subnets); outbound = "direct-custvpn" })
+        }
+        $custDomainRules = [System.Collections.Generic.List[string]]::new()
+        foreach ($s in $EnterpriseVpn.Suffixes) { if ($s -and -not $custDomainRules.Contains($s)) { $custDomainRules.Add($s) } }
+        foreach ($s in $ExtraCorpDomains) {
+            $norm = $s.Trim()
+            if ($norm -and -not $norm.StartsWith(".")) { $norm = ".$norm" }
+            if ($norm -and -not $custDomainRules.Contains($norm)) { $custDomainRules.Add($norm) }
+        }
+        if ($custDomainRules.Count -gt 0) {
+            $routeRules.Add([pscustomobject]@{ domain_suffix = @($custDomainRules); outbound = "direct-custvpn" })
+        }
+        $routeRules.Add([pscustomobject]@{ domain_regex = @("^[^.]+$"); outbound = "direct-custvpn" })
+    }
+
+    $routeRules.Add([pscustomobject]@{
+        domain_suffix = @(".paloaltonetworks.com", ".traps.paloaltonetworks.com")
+        outbound      = "direct-wifi"
+    })
+    $routeRules.Add([pscustomobject]@{ ip_is_private = $true; outbound = "direct" })
+    $routeRules.Add([pscustomobject]@{ ip_cidr = @($tunExcludeList); outbound = "direct" })
+
+    $clusterCfg = [pscustomobject]@{
+        log = [pscustomobject]@{ level = "warn"; timestamp = $true }
+        dns = [pscustomobject]@{
+            servers = @($dnsServers)
+            rules   = @($dnsRules)
+            final   = "dns-remote-doh"
+        }
+        inbounds  = @($inbounds)
+        outbounds = @($fullOutbounds)
+        route     = [pscustomobject]@{
+            default_domain_resolver = $wifiDnsTag
+            find_process            = $true
+            rules                   = @($routeRules)
+            auto_detect_interface   = $true
+            final                   = "proxy"
+        }
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $jsonOut = $clusterCfg | ConvertTo-Json -Depth 20
+    [System.IO.File]::WriteAllText($OutConfigPath, $jsonOut, $utf8NoBom)
+    return $fullOutbounds.Count
+}
+
+# ── Helper: Start / Restart Sing-Box Process Cleanly ──────────────────────────
+function Start-SingBoxClusterEngine {
+    param([string]$ExePath, [string]$CfgPath)
+
+    if ($script:SingBoxProcess -ne $null) {
+        try {
+            Get-EventSubscriber | Where-Object { $_.SourceIdentifier -like "SingBoxCluster*" } | Unregister-Event -ErrorAction SilentlyContinue
+        } catch {}
+        if (-not $script:SingBoxProcess.HasExited) {
+            try { $script:SingBoxProcess.Kill(); $script:SingBoxProcess.WaitForExit(3000) | Out-Null } catch {}
+        }
+        $script:SingBoxProcess.Dispose()
+        $script:SingBoxProcess = $null
+        Start-Sleep -Milliseconds 300
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $ExePath
+    $psi.Arguments              = "run -c `"$CfgPath`""
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $false
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $proc.EnableRaisingEvents = $true
+
+    $idSuffix = [guid]::NewGuid().ToString("N").Substring(0, 8)
+    Register-ObjectEvent $proc OutputDataReceived -SourceIdentifier "SingBoxClusterOut_$idSuffix" -Action {
+        if ($Event.SourceEventArgs.Data) { Write-Host "[cluster] $($Event.SourceEventArgs.Data)" -ForegroundColor DarkGray }
+    } | Out-Null
+    Register-ObjectEvent $proc ErrorDataReceived -SourceIdentifier "SingBoxClusterErr_$idSuffix" -Action {
+        if ($Event.SourceEventArgs.Data) { Write-Host "[cluster] $($Event.SourceEventArgs.Data)" -ForegroundColor DarkYellow }
+    } | Out-Null
+
+    $proc.Start() | Out-Null
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+    $script:SingBoxProcess = $proc
+
+    Start-Sleep -Seconds 2
+    return (-not $proc.HasExited)
+}
+
+# 9. Synthesize Initial Cluster Configuration
+$totalTargets = New-SingBoxClusterConfig `
+    -PhysicalGw $gw `
+    -EnterpriseVpn $vpnState `
+    -Nodes $approvedNodes `
+    -HostsTable $hostsMap `
+    -UserCustomerSubnets $CustomerSubnets `
+    -ExtraCorpDomains $CorpDomains `
+    -UseProxyOnly ([bool]$ProxyOnly) `
+    -LocalMixedPort $MixedPort `
+    -OutConfigPath $TempConfigPath
+
+Write-Ok "Cluster configuration synthesized ($totalTargets total targets)."
+
+# Optional System Proxy activation (for -ProxyOnly -SystemProxy)
+if ($SystemProxy) {
+    $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    $cur = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+    $script:PrevProxyState = [pscustomobject]@{
+        Enable   = if ($cur.ProxyEnable) { $cur.ProxyEnable } else { 0 }
+        Server   = if ($cur.ProxyServer) { $cur.ProxyServer } else { "" }
+        Override = if ($cur.ProxyOverride) { $cur.ProxyOverride } else { "" }
+    }
+    $bypassList = @("<local>", "localhost", "127.*", "10.*", "172.16.*", "192.168.*", "*.local", "*.internal", "*.corp", "*.lan")
+    foreach ($sfx in $vpnState.Suffixes) { $bypassList += "*$sfx" }
+    foreach ($cd in $CorpDomains)        { $bypassList += "*$cd" }
+    $bypassStr = ($bypassList | Select-Object -Unique) -join ";"
+    Set-WindowsSystemProxyState -Enable $true -Server "127.0.0.1:$MixedPort" -Bypass $bypassStr
+    $script:AppliedSystemProxy = $true
+    Write-Ok "Windows System Proxy enabled -> 127.0.0.1:$MixedPort (Corporate & LAN bypassed)."
+}
+
+# 10. Launch sing-box Cluster Engine
 Write-Host ""
 Write-Info "Starting sing-box Cluster Engine..."
-
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName               = $singBoxExe
-$psi.Arguments              = "run -c `"$TempConfigPath`""
-$psi.UseShellExecute        = $false
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError  = $true
-$psi.CreateNoWindow         = $false
-
-$SingBoxProcess = New-Object System.Diagnostics.Process
-$SingBoxProcess.StartInfo = $psi
-$SingBoxProcess.EnableRaisingEvents = $true
-
-Register-ObjectEvent $SingBoxProcess OutputDataReceived -Action {
-    if ($Event.SourceEventArgs.Data) { Write-Host "[cluster] $($Event.SourceEventArgs.Data)" -ForegroundColor DarkGray }
-} | Out-Null
-Register-ObjectEvent $SingBoxProcess ErrorDataReceived -Action {
-    if ($Event.SourceEventArgs.Data) { Write-Host "[cluster] $($Event.SourceEventArgs.Data)" -ForegroundColor DarkYellow }
-} | Out-Null
-
-$SingBoxProcess.Start() | Out-Null
-$SingBoxProcess.BeginOutputReadLine()
-$SingBoxProcess.BeginErrorReadLine()
-
-Start-Sleep -Seconds 2
-
-if ($SingBoxProcess.HasExited) {
+$started = Start-SingBoxClusterEngine -ExePath $singBoxExe -CfgPath $TempConfigPath
+if (-not $started) {
     Write-Err "sing-box cluster failed to start (exit code: $($SingBoxProcess.ExitCode))"
     Invoke-Cleanup
     exit 1
@@ -847,25 +1231,75 @@ Write-Ok "sing-box Cluster is ACTIVE (PID: $($SingBoxProcess.Id))"
 
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Green
-Write-Host "  CONNECTED! CLUSTER LOAD-BALANCER ACTIVE (GEO-FILTERED)" -ForegroundColor Green
+if ($ProxyOnly) {
+    Write-Host "  CONNECTED! PROXY-ONLY MODE (100% FORTICLIENT ISOLATED)" -ForegroundColor Green
+} else {
+    Write-Host "  CONNECTED! CLUSTER LOAD-BALANCER ACTIVE (FORTICLIENT SAFE)" -ForegroundColor Green
+}
 Write-Host "================================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  * Approved Nodes      : $($approvedNodes.Count) active nodes in pool ($droppedCount blocked)" -ForegroundColor White
+Write-Host "  * Physical Binding    : Always bound directly to '$($gw.Name)' ($($gw.Gateway))" -ForegroundColor White
 Write-Host "  * Active Mode         : ⚡ Auto Lowest-Ping (Health-checks every 1 min)" -ForegroundColor White
-Write-Host "  * Auto-Failover       : Active (instant switch if a node dies or lags)" -ForegroundColor White
 Write-Host "  * Antigravity Safe    : Blocked regions ($($BlockedCountries -join ', ')) filtered out" -ForegroundColor White
-Write-Host "  * Customer VPN        : Split-tunnel intact ($($CustomerSubnets -join ', '))" -ForegroundColor Cyan
+if ($ProxyOnly) {
+    Write-Host "  * Local Proxy Address : http://127.0.0.1:$MixedPort  &  socks5://127.0.0.1:$MixedPort" -ForegroundColor Cyan
+}
+$vpnLabel = if ($vpnState.Active) { "ACTIVE ($($vpnState.Adapters -join ', ')) - Auto-Excluded & DNS Bridged" } else { "Monitoring (Connect FortiClient anytime - auto-bridges!)" }
+Write-Host "  * Customer VPN Status : $vpnLabel" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  Press Ctrl+C to disconnect and restore all routes." -ForegroundColor DarkGray
 Write-Host "================================================================" -ForegroundColor Green
 Write-Host ""
 
-# 15. Keep alive loop
+# 11. Keep-Alive & Dynamic Customer VPN Coexistence Watcher Loop
+$lastCheck = Get-Date
+$activeVpnSig = $vpnState.Signature
 try {
     while (-not $SingBoxProcess.HasExited) {
         Start-Sleep -Milliseconds 500
+        if (((Get-Date) - $lastCheck).TotalSeconds -ge 2.0) {
+            $lastCheck = Get-Date
+            $probeVpn = Get-EnterpriseVpnState -PhysicalGw $gw -ProxyServerIPs $allowedServerIPs
+            if ($probeVpn.Signature -ne $activeVpnSig) {
+                # Brief debounce so FortiClient finishes applying all routes and DNS IPs
+                Start-Sleep -Milliseconds 1500
+                $probeVpn = Get-EnterpriseVpnState -PhysicalGw $gw -ProxyServerIPs $allowedServerIPs
+                if ($probeVpn.Signature -ne $activeVpnSig) {
+                    Write-Host ""
+                    if ($probeVpn.Active) {
+                        Write-Warn "Customer VPN connected/updated ($($probeVpn.Adapters -join ', ')) -> syncing routes & corporate DNS..."
+                        if ($probeVpn.HasFullTunnel -and -not $ProxyOnly) {
+                            Write-Warn "FortiClient is Full-Tunnel (0.0.0.0/0). If it rejects coexistence with TUN, run with -ProxyOnly -SystemProxy."
+                        }
+                    } else {
+                        Write-Info "Customer VPN disconnected -> restoring standard cluster routing..."
+                    }
+                    $activeVpnSig = $probeVpn.Signature
+                    $null = New-SingBoxClusterConfig `
+                        -PhysicalGw $gw `
+                        -EnterpriseVpn $probeVpn `
+                        -Nodes $approvedNodes `
+                        -HostsTable $hostsMap `
+                        -UserCustomerSubnets $CustomerSubnets `
+                        -ExtraCorpDomains $CorpDomains `
+                        -UseProxyOnly ([bool]$ProxyOnly) `
+                        -LocalMixedPort $MixedPort `
+                        -OutConfigPath $TempConfigPath
+                    $reloaded = Start-SingBoxClusterEngine -ExePath $singBoxExe -CfgPath $TempConfigPath
+                    if ($reloaded) {
+                        Write-Ok "Cluster hot-reloaded cleanly (PID: $($SingBoxProcess.Id)). Both VPNs synchronized!"
+                    } else {
+                        Write-Err "Cluster reload failed (exit code: $($SingBoxProcess.ExitCode))"
+                        break
+                    }
+                }
+            }
+        }
     }
-    Write-Warn "sing-box cluster stopped (exit code: $($SingBoxProcess.ExitCode))"
+    if ($SingBoxProcess.HasExited) {
+        Write-Warn "sing-box cluster stopped (exit code: $($SingBoxProcess.ExitCode))"
+    }
 } finally {
     Invoke-Cleanup
 }
