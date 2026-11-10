@@ -62,6 +62,18 @@ $AppliedSystemProxy   = $false
 $PrevProxyState       = $null
 $CleanupExecuted      = $false
 
+# ── Native route.exe Wrapper (Prevents ErrorActionPreference=Stop crashes) ─────
+function Invoke-RouteNative {
+    param([string[]]$RouteArgs)
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    try {
+        & route.exe @RouteArgs *>$null
+    } finally {
+        $ErrorActionPreference = $oldEap
+    }
+}
+
 # ── Fast Route Cleanup (Preserves Customer VPN Gateway Routes) ────────────────
 function Clear-TrackedRoutesFast {
     param([string[]]$ExcludeCidrs = @())
@@ -84,9 +96,13 @@ function Clear-TrackedRoutesFast {
         foreach ($ex in $ExcludeCidrs) {
             if ($ex -match '^(.+?)/32$') { $null = $excludeSet.Add($matches[1]) }
         }
+        $activeHostIPs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($rt in (Get-NetRoute -DestinationPrefix "*/32" -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+            $null = $activeHostIPs.Add(($rt.DestinationPrefix -replace '/32$',''))
+        }
         foreach ($ip in $ipsToDelete) {
-            if (-not $excludeSet.Contains($ip)) {
-                & route.exe delete $ip 2>$null | Out-Null
+            if (-not $excludeSet.Contains($ip) -and $activeHostIPs.Contains($ip)) {
+                Invoke-RouteNative @("delete", $ip)
             }
         }
     }
@@ -355,11 +371,29 @@ function Add-TrackedRoutesBatch {
     param([string[]]$IPs, [string]$Gateway, [int]$IfIndex, [int]$Metric = 5)
     if (-not $IPs -or $IPs.Count -eq 0) { return }
 
+    $existingRoutesByIP = @{}
+    foreach ($rt in (Get-NetRoute -DestinationPrefix "*/32" -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+        $rawIp = $rt.DestinationPrefix -replace '/32$',''
+        if (-not $existingRoutesByIP.ContainsKey($rawIp)) {
+            $existingRoutesByIP[$rawIp] = [System.Collections.Generic.List[object]]::new()
+        }
+        $existingRoutesByIP[$rawIp].Add($rt)
+    }
+
     foreach ($ip in $IPs) {
         if (-not $ip) { continue }
-        # Native route.exe change/add is >50x faster than PowerShell New-NetRoute WMI loop
-        & route.exe delete $ip 2>$null | Out-Null
-        & route.exe add $ip mask 255.255.255.255 $Gateway metric $Metric if $IfIndex 2>$null | Out-Null
+        $alreadyClean = $false
+        if ($existingRoutesByIP.ContainsKey($ip)) {
+            $rts = $existingRoutesByIP[$ip]
+            if ($rts.Count -eq 1 -and $rts[0].NextHop -eq $Gateway -and $rts[0].InterfaceIndex -eq $IfIndex) {
+                $alreadyClean = $true
+            } else {
+                Invoke-RouteNative @("delete", $ip)
+            }
+        }
+        if (-not $alreadyClean) {
+            Invoke-RouteNative @("add", $ip, "mask", "255.255.255.255", $Gateway, "metric", "$Metric", "if", "$IfIndex")
+        }
         if (-not $CreatedRoutes.Contains($ip)) {
             $CreatedRoutes.Add($ip)
         }
