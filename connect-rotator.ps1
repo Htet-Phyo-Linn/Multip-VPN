@@ -573,6 +573,13 @@ $mixedInbound = [pscustomobject]@{
 $allRules = [System.Collections.Generic.List[object]]::new()
 $allRules.Add([pscustomobject]@{ action = "sniff" })
 $allRules.Add([pscustomobject]@{ protocol = "dns"; action = "hijack-dns" })
+$allRules.Add([pscustomobject]@{
+    domain_suffix = @(
+        ".paloaltonetworks.com",
+        ".traps.paloaltonetworks.com"
+    )
+    outbound = "direct"
+})
 $allRules.Add([pscustomobject]@{ ip_is_private = $true; outbound = "direct" })
 $allRules.Add([pscustomobject]@{ ip_cidr = @($excludeList); outbound = "direct" })
 foreach ($rr in $rotatorRules) { $allRules.Add($rr) }
@@ -581,21 +588,58 @@ $finalConfig = [pscustomobject]@{
     log = [pscustomobject]@{ level = "warn"; timestamp = $true }
     dns = [pscustomobject]@{
         servers = @(
-            [pscustomobject]@{ tag = "dns-remote-tcp"; type = "tcp";   server = "8.8.8.8"; detour = $rotatingPool[0].tag },
-            [pscustomobject]@{ tag = "dns-remote-doh"; type = "https"; server = "https://1.1.1.1/dns-query"; detour = $rotatingPool[0].tag },
-            [pscustomobject]@{ tag = "dns-local";      type = "local" }
+            [pscustomobject]@{
+                tag         = "dns-remote-doh"
+                type        = "https"
+                server      = "1.1.1.1"
+                server_port = 443
+                path        = "/dns-query"
+                detour      = $rotatingPool[0].tag
+            },
+            [pscustomobject]@{
+                tag         = "dns-google-doh"
+                type        = "https"
+                server      = "8.8.8.8"
+                server_port = 443
+                path        = "/dns-query"
+                detour      = $rotatingPool[0].tag
+            },
+            [pscustomobject]@{
+                tag  = "dns-local"
+                type = "local"
+            }
         )
         rules = @(
-            [pscustomobject]@{ ip_is_private = $true; server = "dns-local" }
+            [pscustomobject]@{
+                domain_suffix = @(
+                    ".sharepoint.com",
+                    ".paloaltonetworks.com",
+                    ".traps.paloaltonetworks.com",
+                    ".microsoft.com",
+                    ".office.com",
+                    ".office365.com",
+                    ".msftauth.net",
+                    ".live.com",
+                    ".local",
+                    ".lan",
+                    ".home",
+                    ".internal",
+                    ".corp",
+                    "in-addr.arpa",
+                    "ip6.arpa"
+                )
+                server = "dns-local"
+            }
         )
-        final = "dns-remote-tcp"
+        final = "dns-remote-doh"
     }
     inbounds  = @($tunInbound, $mixedInbound)
     outbounds = @($fullOutbounds)
     route     = [pscustomobject]@{
-        rules                 = @($allRules)
-        auto_detect_interface = $true
-        final                 = $rotatingPool[0].tag
+        default_domain_resolver = "dns-local"
+        rules                   = @($allRules)
+        auto_detect_interface   = $true
+        final                   = $rotatingPool[0].tag
     }
 }
 

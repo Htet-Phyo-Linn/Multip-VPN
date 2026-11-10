@@ -686,7 +686,7 @@ foreach ($ip in $allowedServerIPs) {
     if (-not $excludeList.Contains($cidr)) { $excludeList.Add($cidr) }
 }
 
-# 11. DNS Configuration with Hosts Predefined & Reliable TCP/DoH Remote DNS
+# 11. DNS Configuration with Hosts Predefined & Rock-Solid DoH Remote DNS
 $hasHosts = ($hostsMap.PSObject.Properties | Measure-Object).Count -gt 0
 $dnsServers = [System.Collections.Generic.List[object]]::new()
 
@@ -699,23 +699,27 @@ if ($hasHosts) {
     })
 }
 
-# Tier 2: Remote TCP DNS (via Google 8.8.8.8 over proxy - reliable on 100% of proxy nodes)
+# Tier 2: Primary Remote DoH DNS (via Cloudflare 1.1.1.1 over HTTPS port 443 over proxy - NEVER blocked by proxy nodes)
 $dnsServers.Add([pscustomobject]@{
-    tag    = "dns-remote-tcp"
-    type   = "tcp"
-    server = "8.8.8.8"
-    detour = "proxy"
+    tag         = "dns-remote-doh"
+    type        = "https"
+    server      = "1.1.1.1"
+    server_port = 443
+    path        = "/dns-query"
+    detour      = "proxy"
 })
 
-# Tier 3: Remote DoH DNS (via Cloudflare 1.1.1.1 over HTTPS over proxy)
+# Tier 3: Secondary Remote DoH DNS (via Google 8.8.8.8 over HTTPS port 443 over proxy)
 $dnsServers.Add([pscustomobject]@{
-    tag    = "dns-remote-doh"
-    type   = "https"
-    server = "https://1.1.1.1/dns-query"
-    detour = "proxy"
+    tag         = "dns-google-doh"
+    type        = "https"
+    server      = "8.8.8.8"
+    server_port = 443
+    path        = "/dns-query"
+    detour      = "proxy"
 })
 
-# Tier 4: Local physical adapter DNS (for private LAN, Customer VPN, and loopback)
+# Tier 4: Local physical adapter DNS (for private LAN, Customer VPN, and corporate domains)
 $dnsServers.Add([pscustomobject]@{
     tag  = "dns-local"
     type = "local"
@@ -726,8 +730,28 @@ if ($hasHosts) {
     $hostDomains = @($hostsMap.PSObject.Properties | ForEach-Object { $_.Name })
     $dnsRules.Add([pscustomobject]@{ domain = $hostDomains; server = "dns-hosts" })
 }
-# Route private subnets, localhost, and customer VPNs directly to local DNS
-$dnsRules.Add([pscustomobject]@{ ip_is_private = $true; server = "dns-local" })
+
+# Route corporate Microsoft, Palo Alto Cortex Traps, customer VPN, and LAN queries to local DNS
+$dnsRules.Add([pscustomobject]@{
+    domain_suffix = @(
+        ".sharepoint.com",
+        ".paloaltonetworks.com",
+        ".traps.paloaltonetworks.com",
+        ".microsoft.com",
+        ".office.com",
+        ".office365.com",
+        ".msftauth.net",
+        ".live.com",
+        ".local",
+        ".lan",
+        ".home",
+        ".internal",
+        ".corp",
+        "in-addr.arpa",
+        "ip6.arpa"
+    )
+    server = "dns-local"
+})
 
 # 12. Transparent TUN Inbound
 $tunInbound = [pscustomobject]@{
@@ -742,10 +766,18 @@ $tunInbound = [pscustomobject]@{
 
 # 13. Routing Rules (Antigravity & Customer VPN Safe)
 $routeBlock = [pscustomobject]@{
-    default_domain_resolver = if ($hasHosts) { "dns-hosts" } else { "dns-local" }
+    default_domain_resolver = "dns-local"
     rules = @(
         [pscustomobject]@{ action = "sniff" },
         [pscustomobject]@{ protocol = "dns"; action = "hijack-dns" },
+        # Bypass corporate endpoint security and Palo Alto Traps
+        [pscustomobject]@{
+            domain_suffix = @(
+                ".paloaltonetworks.com",
+                ".traps.paloaltonetworks.com"
+            )
+            outbound = "direct"
+        },
         # Bypass all private IP traffic (Localhost 127.0.0.1, LAN, Customer VPN)
         [pscustomobject]@{ ip_is_private = $true; outbound = "direct" },
         # Bypass all explicit subnets & VPN server IPs
@@ -763,7 +795,7 @@ $finalClusterConfig = [pscustomobject]@{
     dns = [pscustomobject]@{
         servers = @($dnsServers)
         rules   = @($dnsRules)
-        final   = "dns-remote-tcp"
+        final   = "dns-remote-doh"
     }
     inbounds  = @($tunInbound)
     outbounds = @($fullOutbounds)

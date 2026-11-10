@@ -175,10 +175,19 @@ fi
 echo -e "${WHITE}    Discovered ${NODE_COUNT} outbound node(s).${NC}"
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  4. SYNTHESIZE TERMUX RUN CONFIGURATION
+#  4. SYNTHESIZE TERMUX RUN CONFIGURATION (TUN Full-Tunnel or Proxy Gateway)
 # ──────────────────────────────────────────────────────────────────────────────
 RUN_CONFIG="$SCRIPT_DIR/_termux_singbox_run.json"
-echo -e "${CYAN}[*] Synthesizing Termux proxy gateway (Binding to ${AUTH_IP}:${PROXY_PORT})...${NC}"
+
+# Check if device has root access (su / tsu)
+HAS_ROOT=0
+if [ "$(id -u)" = "0" ]; then
+    HAS_ROOT=1
+elif command -v su >/dev/null 2>&1; then
+    if su -c "id" 2>/dev/null | grep -q "uid=0"; then
+        HAS_ROOT=1
+    fi
+fi
 
 # Extract raw outbounds array
 OUTBOUNDS_JSON="[]"
@@ -186,26 +195,73 @@ if check_pkg jq; then
     OUTBOUNDS_JSON=$(jq '.outbounds // []' "$TARGET_CONFIG")
 fi
 
-# Build complete sing-box JSON for Termux
+if [ $HAS_ROOT -eq 1 ]; then
+    echo -e "${GREEN}[+] ROOT PRIVILEGES DETECTED! Enabling System-Wide Auto Full-Tunnel (TUN + Gateway).${NC}"
+    INBOUNDS_JSON='[
+      {
+        "type": "tun",
+        "tag": "tun-in",
+        "interface_name": "tun0",
+        "address": ["172.19.0.1/30"],
+        "auto_route": true,
+        "strict_route": false,
+        "stack": "mixed",
+        "route_exclude_address": ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]
+      },
+      {
+        "type": "mixed",
+        "tag": "mixed-in",
+        "listen": "0.0.0.0",
+        "listen_port": '${PROXY_PORT}'
+      }
+    ]'
+else
+    echo -e "${YELLOW}[!] Non-Root Mode: Running as LAN Proxy Gateway (192.168.1.2:${PROXY_PORT}).${NC}"
+    echo -e "${GRAY}    (To tunnel 100% of phone apps automatically, grant Root / su or configure Wi-Fi proxy).${NC}"
+    INBOUNDS_JSON='[
+      {
+        "type": "mixed",
+        "tag": "mixed-in",
+        "listen": "0.0.0.0",
+        "listen_port": '${PROXY_PORT}'
+      }
+    ]'
+fi
+
+# Build complete sing-box JSON for Termux with Rock-Solid DoH (Port 443)
 cat << EOF > "$RUN_CONFIG"
 {
   "log": {
     "level": "warn",
     "timestamp": true
   },
-  "inbounds": [
-    {
-      "type": "mixed",
-      "tag": "mixed-in",
-      "listen": "0.0.0.0",
-      "listen_port": ${PROXY_PORT}
-    }
-  ],
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-remote-doh",
+        "type": "https",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query"
+      },
+      {
+        "tag": "dns-local",
+        "type": "local"
+      }
+    ],
+    "final": "dns-remote-doh"
+  },
+  "inbounds": ${INBOUNDS_JSON},
   "outbounds": ${OUTBOUNDS_JSON},
   "route": {
+    "default_domain_resolver": "dns-local",
     "rules": [
       {
         "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
       },
       {
         "ip_is_private": true,
@@ -223,6 +279,11 @@ if ! "$SINGBOX_BIN" check -c "$RUN_CONFIG" >/dev/null 2>&1; then
     cat << EOF > "$RUN_CONFIG"
 {
   "log": { "level": "warn", "timestamp": true },
+  "dns": {
+    "servers": [
+      { "tag": "dns-local", "type": "local" }
+    ]
+  },
   "inbounds": [
     {
       "type": "mixed",
@@ -242,22 +303,36 @@ fi
 #  5. LAUNCH CONTROLLER & KEEP-ALIVE
 # ──────────────────────────────────────────────────────────────────────────────
 # Stop any existing instance
-killall sing-box 2>/dev/null || true
+if [ $HAS_ROOT -eq 1 ] && [ "$(id -u)" != "0" ]; then
+    su -c "killall sing-box 2>/dev/null || true"
+else
+    killall sing-box 2>/dev/null || true
+fi
 sleep 0.5
 
 cleanup() {
     echo ""
     echo -e "${YELLOW}[*] Shutting down sing-box on Termux...${NC}"
-    killall sing-box 2>/dev/null || true
+    if [ $HAS_ROOT -eq 1 ] && [ "$(id -u)" != "0" ]; then
+        su -c "killall sing-box 2>/dev/null || true"
+    else
+        killall sing-box 2>/dev/null || true
+    fi
     rm -f "$RUN_CONFIG"
     echo -e "${GREEN}[+] Termux network restored.${NC}"
     exit 0
 }
 trap cleanup SIGINT SIGTERM EXIT
 
-echo -e "${CYAN}[*] Starting sing-box service on Termux background...${NC}"
-"$SINGBOX_BIN" run -c "$RUN_CONFIG" &
-SINGBOX_PID=$!
+echo -e "${CYAN}[*] Starting sing-box service on Termux...${NC}"
+if [ $HAS_ROOT -eq 1 ] && [ "$(id -u)" != "0" ]; then
+    echo -e "${GREEN}[+] Spawning elevated TUN engine via su (Root Full-Tunnel Active)...${NC}"
+    su -c "$SINGBOX_BIN run -c $RUN_CONFIG" &
+    SINGBOX_PID=$!
+else
+    "$SINGBOX_BIN" run -c "$RUN_CONFIG" &
+    SINGBOX_PID=$!
+fi
 
 sleep 1.5
 
