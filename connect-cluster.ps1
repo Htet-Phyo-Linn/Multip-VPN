@@ -251,12 +251,14 @@ function Get-EnterpriseVpnState {
         [System.Collections.Generic.HashSet[string]]$ProxyServerIPs
     )
 
-    $vpnAdapters = [System.Collections.Generic.List[string]]::new()
-    $subnets     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $gwCidrs     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $dnsServers  = [System.Collections.Generic.List[string]]::new()
-    $suffixes    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $hasFullTunnel = $false
+    $vpnAdapters    = [System.Collections.Generic.List[string]]::new()
+    $adapterSubnets = @{}
+    $subnets        = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $gwCidrs        = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $dnsServers     = [System.Collections.Generic.List[string]]::new()
+    $dnsBindings    = [System.Collections.Generic.List[object]]::new()
+    $suffixes       = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $hasFullTunnel  = $false
 
     $matchPattern = 'fortinet|fortissl|cisco|anyconnect|pangp|globalprotect|pulse|juniper|sonicwall|check point|checkpoint'
     $allAdapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
@@ -271,6 +273,7 @@ function Get-EnterpriseVpnState {
         if ($ipIf -and $ipIf.ConnectionState -ne "Connected") { continue }
 
         $vpnAdapters.Add($ad.Name)
+        $perAdRoutes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
         # Collect active routes pushed onto this VPN adapter (both private & customer public blocks)
         $ifRoutes = Get-NetRoute -InterfaceIndex $ifIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue
@@ -284,13 +287,18 @@ function Get-EnterpriseVpnState {
             # Skip local link-broadcast or interface host self-/32 (RouteMetric 256 & NextHop 0.0.0.0)
             if ($pfx -like "*/32" -and $rt.NextHop -eq "0.0.0.0" -and $rt.RouteMetric -eq 256) { continue }
             $null = $subnets.Add($pfx)
+            $null = $perAdRoutes.Add($pfx)
         }
+        $adapterSubnets[$ad.Name] = @($perAdRoutes | Sort-Object)
 
-        # Collect valid internal corporate DNS servers assigned by customer VPN
+        # Collect valid internal corporate DNS servers assigned by customer VPN (paired with owning adapter)
         $adDns = (Get-DnsClientServerAddress -InterfaceIndex $ifIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
         foreach ($d in $adDns) {
             if ($d -and $d -ne "0.0.0.0" -and $d -notlike "127.*" -and $d -notlike "169.254.*" -and $d -notlike "172.19.0.*") {
-                if (-not $dnsServers.Contains($d)) { $dnsServers.Add($d) }
+                if (-not $dnsServers.Contains($d)) {
+                    $dnsServers.Add($d)
+                    $dnsBindings.Add([pscustomobject]@{ Ip = $d; Adapter = $ad.Name })
+                }
             }
         }
 
@@ -357,9 +365,11 @@ function Get-EnterpriseVpnState {
         Active         = ($vpnAdapters.Count -gt 0)
         PrimaryAdapter = if ($vpnAdapters.Count -gt 0) { $vpnAdapters[0] } else { "" }
         Adapters       = $sortedAdapters
+        AdapterSubnets = $adapterSubnets
         Subnets        = $sortedSubnets
         GatewayCidrs   = $sortedGw
         DnsServers     = $sortedDns
+        DnsBindings    = @($dnsBindings)
         Suffixes       = $sortedSuffixes
         HasFullTunnel  = $hasFullTunnel
         Signature      = $sig
@@ -941,24 +951,42 @@ function New-SingBoxClusterConfig {
         outbounds = @($allNodeTags)
     })
 
-    # Direct Outbounds: Physical Wi-Fi Direct, Customer VPN Direct (when active), Standard OS Direct, Block
+    # Direct Outbounds: Physical Wi-Fi Direct, Per-Adapter Customer VPN Direct (always bound, never empty), Standard OS Direct, Block
     $clusterGroups.Add([pscustomobject]@{
         type           = "direct"
         tag            = "direct-wifi"
         bind_interface = $PhysicalGw.Name
     })
+
+    $vpnAdapterTags = @{}
+    $custDnsTag = "direct"
+    $targetCustDnsIp = ""
     if ($EnterpriseVpn.Active) {
-        if ($EnterpriseVpn.Adapters.Count -eq 1 -and $EnterpriseVpn.PrimaryAdapter) {
+        $vpnIdx = 0
+        foreach ($adName in $EnterpriseVpn.Adapters) {
+            if (-not $adName) { continue }
+            $tagName = "direct-vpn-$vpnIdx"
+            $vpnAdapterTags[$adName] = $tagName
             $clusterGroups.Add([pscustomobject]@{
                 type           = "direct"
-                tag            = "direct-custvpn"
-                bind_interface = $EnterpriseVpn.PrimaryAdapter
+                tag            = $tagName
+                bind_interface = $adName
             })
-        } else {
-            $clusterGroups.Add([pscustomobject]@{
-                type = "direct"
-                tag  = "direct-custvpn"
-            })
+            $vpnIdx++
+        }
+
+        $primaryDnsOwner = $EnterpriseVpn.PrimaryAdapter
+        if ($EnterpriseVpn.DnsBindings -and $EnterpriseVpn.DnsBindings.Count -gt 0) {
+            $targetCustDnsIp = $EnterpriseVpn.DnsBindings[0].Ip
+            $primaryDnsOwner = $EnterpriseVpn.DnsBindings[0].Adapter
+        } elseif ($EnterpriseVpn.DnsServers.Count -gt 0) {
+            $targetCustDnsIp = $EnterpriseVpn.DnsServers[0]
+        }
+
+        if ($primaryDnsOwner -and $vpnAdapterTags.ContainsKey($primaryDnsOwner)) {
+            $custDnsTag = $vpnAdapterTags[$primaryDnsOwner]
+        } elseif ($vpnAdapterTags.Count -gt 0) {
+            $custDnsTag = @($vpnAdapterTags.Values)[0]
         }
     }
     $clusterGroups.Add([pscustomobject]@{ type = "direct"; tag = "direct" })
@@ -1020,14 +1048,18 @@ function New-SingBoxClusterConfig {
     }
 
     # Customer VPN Internal DNS (active only when FortiClient/AnyConnect/PANGP provides DNS)
-    $hasCustDns = ($EnterpriseVpn.Active -and $EnterpriseVpn.DnsServers.Count -gt 0)
+    $hasCustDns = ($EnterpriseVpn.Active -and $targetCustDnsIp -ne "")
     if ($hasCustDns) {
-        $dnsServers.Add([pscustomobject]@{
+        $dnsObj = [pscustomobject]@{
             tag    = "dns-custvpn"
             type   = "udp"
-            server = $EnterpriseVpn.DnsServers[0]
-            detour = "direct-custvpn"
-        })
+            server = $targetCustDnsIp
+        }
+        # Only detour to a bound adapter outbound (sing-box rejects detours to empty direct outbounds)
+        if ($custDnsTag -ne "direct") {
+            $dnsObj | Add-Member -MemberType NoteProperty -Name "detour" -Value $custDnsTag
+        }
+        $dnsServers.Add($dnsObj)
     }
 
     # Remote DoH DNS over port 443 through cluster
@@ -1127,9 +1159,19 @@ function New-SingBoxClusterConfig {
         if ($EnterpriseVpn.GatewayCidrs.Count -gt 0) {
             $routeRules.Add([pscustomobject]@{ ip_cidr = @($EnterpriseVpn.GatewayCidrs); outbound = "direct-wifi" })
         }
-        if ($EnterpriseVpn.Subnets.Count -gt 0) {
-            $routeRules.Add([pscustomobject]@{ ip_cidr = @($EnterpriseVpn.Subnets); outbound = "direct-custvpn" })
+        # Route each customer VPN adapter's subnets out its own interface
+        if ($EnterpriseVpn.AdapterSubnets -and $vpnAdapterTags.Count -gt 0) {
+            foreach ($adName in $EnterpriseVpn.Adapters) {
+                $adRoutes = $EnterpriseVpn.AdapterSubnets[$adName]
+                $adTag = $vpnAdapterTags[$adName]
+                if ($adRoutes -and $adRoutes.Count -gt 0 -and $adTag) {
+                    $routeRules.Add([pscustomobject]@{ ip_cidr = @($adRoutes); outbound = $adTag })
+                }
+            }
+        } elseif ($EnterpriseVpn.Subnets.Count -gt 0) {
+            $routeRules.Add([pscustomobject]@{ ip_cidr = @($EnterpriseVpn.Subnets); outbound = $custDnsTag })
         }
+
         $custDomainRules = [System.Collections.Generic.List[string]]::new()
         foreach ($s in $EnterpriseVpn.Suffixes) { if ($s -and -not $custDomainRules.Contains($s)) { $custDomainRules.Add($s) } }
         foreach ($s in $ExtraCorpDomains) {
@@ -1138,9 +1180,9 @@ function New-SingBoxClusterConfig {
             if ($norm -and -not $custDomainRules.Contains($norm)) { $custDomainRules.Add($norm) }
         }
         if ($custDomainRules.Count -gt 0) {
-            $routeRules.Add([pscustomobject]@{ domain_suffix = @($custDomainRules); outbound = "direct-custvpn" })
+            $routeRules.Add([pscustomobject]@{ domain_suffix = @($custDomainRules); outbound = $custDnsTag })
         }
-        $routeRules.Add([pscustomobject]@{ domain_regex = @("^[^.]+$"); outbound = "direct-custvpn" })
+        $routeRules.Add([pscustomobject]@{ domain_regex = @("^[^.]+$"); outbound = $custDnsTag })
     }
 
     $routeRules.Add([pscustomobject]@{
