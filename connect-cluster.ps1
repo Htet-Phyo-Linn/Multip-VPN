@@ -1079,7 +1079,7 @@ function New-SingBoxClusterConfig {
     }
 
     $localCloudSuffixes = @(
-        ".sharepoint.com", ".paloaltonetworks.com", ".traps.paloaltonetworks.com",
+        ".sharepoint.com", ".traps.paloaltonetworks.com",
         ".microsoft.com", ".office.com", ".office365.com", ".msftauth.net", ".live.com"
     )
     $localFallbackSuffixes = [System.Collections.Generic.List[string]]::new()
@@ -1144,7 +1144,7 @@ function New-SingBoxClusterConfig {
     }
 
     $routeRules.Add([pscustomobject]@{
-        domain_suffix = @(".paloaltonetworks.com", ".traps.paloaltonetworks.com")
+        domain_suffix = @(".traps.paloaltonetworks.com")
         outbound      = "direct-wifi"
     })
     $routeRules.Add([pscustomobject]@{ ip_is_private = $true; outbound = "direct" })

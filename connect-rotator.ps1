@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Multip VPN - True Per-Connection Round-Robin Rotator (Full Randomizer)
     Every single outbound connection exits through a different proxy node across different countries!
@@ -575,7 +575,6 @@ $allRules.Add([pscustomobject]@{ action = "sniff" })
 $allRules.Add([pscustomobject]@{ protocol = "dns"; action = "hijack-dns" })
 $allRules.Add([pscustomobject]@{
     domain_suffix = @(
-        ".paloaltonetworks.com",
         ".traps.paloaltonetworks.com"
     )
     outbound = "direct"
@@ -613,7 +612,6 @@ $finalConfig = [pscustomobject]@{
             [pscustomobject]@{
                 domain_suffix = @(
                     ".sharepoint.com",
-                    ".paloaltonetworks.com",
                     ".traps.paloaltonetworks.com",
                     ".microsoft.com",
                     ".office.com",
