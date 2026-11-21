@@ -953,7 +953,7 @@ for ($ni = 0; $ni -lt $approvedNodes.Count; $ni++) {
     }
 }
 if ($tcpProbes.Count -gt 0) {
-    try { [System.Threading.Tasks.Task]::WaitAll(@($tcpProbes.Values | ForEach-Object { $_.Task }), 900) | Out-Null } catch {}
+    try { [System.Threading.Tasks.Task]::WaitAll(@($tcpProbes.Values | ForEach-Object { $_.Task }), 2500) | Out-Null } catch {}
 }
 $liveTcpNodes  = [System.Collections.Generic.List[object]]::new()
 $udpHyNodes    = [System.Collections.Generic.List[object]]::new()

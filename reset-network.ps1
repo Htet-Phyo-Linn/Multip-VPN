@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Multip VPN - Deep Network Clean & Factory Restoration Tool
     Restores the Windows TCP/IP networking stack to a clean, post-reboot state.
@@ -198,6 +198,21 @@ if ($routesToPurge.Count -gt 0) {
     Write-Ok "Cleaned $clearedRoutes static bypass route(s)."
 } else {
     Write-Ok "No orphan static bypass routes found in routing table."
+}
+
+# Clean any orphaned 0.0.0.0/1 or 128.0.0.0/1 routes from disconnected or non-corporate TAP adapters
+$orphanSplitRoutes = Get-NetRoute -DestinationPrefix @("0.0.0.0/1", "128.0.0.0/1") -ErrorAction SilentlyContinue |
+                     Where-Object {
+                         $ad = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue
+                         $ad -and ($ad.InterfaceDescription -match "tap|wintun|sing|outline" -or $ad.Name -match "tap|wintun|sing|outline")
+                     }
+if ($orphanSplitRoutes) {
+    foreach ($sr in $orphanSplitRoutes) {
+        try {
+            Remove-NetRoute -DestinationPrefix $sr.DestinationPrefix -InterfaceIndex $sr.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Ok "Removed orphaned split-default route: $($sr.DestinationPrefix) on adapter $($sr.InterfaceIndex)"
+        } catch {}
+    }
 }
 
 # ── 5. Clear All MultipVPN Firewall Rules ─────────────────────────────────────

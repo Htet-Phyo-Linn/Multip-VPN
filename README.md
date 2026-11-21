@@ -1,6 +1,6 @@
 # Multip VPN & Load Balancer
 
-A high-performance transparent TUN VPN and load-balancing toolkit powered by `sing-box`. It features automatic key conversion, live proxy health checks, Antigravity/Google AI policy filtering (auto-dropping Hong Kong, China, etc.), and multi-node lowest-ping clustering.
+A high-performance transparent TUN VPN and load-balancing toolkit powered by `sing-box`. It features automatic key conversion, live proxy health checks, Antigravity/Google AI policy filtering (auto-dropping Hong Kong, China, etc.), multi-node lowest-ping clustering, and live remote subscription auto-updating.
 
 ---
 
@@ -10,6 +10,9 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 | :--- | :---: | :--- |
 | **`Connect-Cluster.bat`** | Batch / Desktop | Starts the **Load-Balanced Cluster** (lowest-ping auto-failover across all available working nodes). |
 | **`connect-cluster.ps1`** | PowerShell | Core engine for the load-balanced cluster. Discovers all nodes, filters blocked countries, and builds the TUN tunnel. |
+| **`Connect-Subscription.bat`** | Batch / Desktop | Starts the **Live Subscription Connector** with auto-update lifecycle and FortiClient corporate shield. |
+| **`connect-subscription.ps1`** | PowerShell | Core live subscription engine. Auto-fetches Gist/Base64/Sub-Store URLs from `subscriptions.txt`, hot-reloads on remote key updates, and enables auto-failover. |
+| **`subscriptions.txt`** | Configuration | Plain text list of remote subscription URLs (Gist, Hiddify, Sub-Store, Clash, or raw share links) to auto-fetch and monitor. |
 | **`Connect-Rotator.bat`** | Batch / Desktop | Starts the **Per-Connection Round-Robin Rotator** (every single connection exits via a different country/IP). |
 | **`connect-rotator.ps1`** | PowerShell | Core kernel source-port modulo randomizer engine with TUN & rotating SOCKS5/HTTP proxy (`127.0.0.1:10808`). |
 | **`Test-Rotation.bat`** | Batch / Desktop | Verifies live IP rotation by issuing 6 rapid requests and displaying the changing public IPs/countries. |
@@ -17,9 +20,9 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 | **`Connect-VPN.bat`** | Batch / Desktop | Starts a **Single VPN connection** using `config.json`. Supports dragging & dropping any `.json` config onto it. |
 | **`connect-vpn.ps1`** | PowerShell | Connects to a specific single configuration file in transparent TUN mode. |
 | **`Clean-Configs.bat`** | Batch / Desktop | 1-Click health check: tests all nodes (16 threads, 9s delay), filters blocked countries, merges all working nodes into `config.json`. |
-| **`clean-configs.ps1`** | PowerShell | Core health cleaner & consolidator engine with 16 parallel workers and configurable `-TimeoutMs 9000`. |
+| **`clean-configs.ps1`** | PowerShell | Core health cleaner & consolidator engine with 16 parallel workers, 2-stage deduplication, and configurable `-TimeoutMs 9000`. |
 | **`Convert-Keys.bat`** | Batch / Desktop | Interactive converter: converts `key.txt` (URLs, base64, share links) into sing-box JSON with 16 parallel threads. |
-| **`convert-keys.ps1`** | PowerShell | Core key converter engine supporting subscriptions, Shadowsocks, VLESS, VMess, Trojan, Hysteria 2, and TUIC. |
+| **`convert-keys.ps1`** | PowerShell | Core key converter engine supporting subscriptions, Shadowsocks, VLESS (Reality/WS), VMess, Trojan, Hysteria 2, and TUIC. |
 | **`Reset-Network.bat`** | Batch / Desktop | **Emergency 1-Click Network Clean & Restoration**: Restores Windows TCP/IP stack to clean post-reboot state (kills rogue sing-box, purges static /32 routes, clears firewall rules, disables proxy, flushes DNS & ARP). |
 | **`reset-network.ps1`** | PowerShell | Core deep network cleanup engine with health & gateway verification. |
 | **`Export-Normal-JSON.bat`** | Batch / Desktop | Extracts pure proxy outbounds from complex configs into clean import format `{ "outbounds": [...] }`. |
@@ -35,20 +38,81 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 ### 1. Load-Balanced Cluster (Recommended for Speed & Redundancy)
 
 #### `Connect-Cluster.bat`
-* **Purpose**: Automatically scans all nodes, runs ping tests, filters out Antigravity-unsupported regions (Hong Kong, etc.), and routes traffic through the fastest live nodes using `urltest`.
+* **Purpose**: Automatically scans all nodes across all `config*.json` files, runs parallel ping checks, filters out Antigravity-unsupported regions (Hong Kong, China, Russia, Iran, etc.), and routes traffic through the fastest live nodes using `urltest`.
+* **Features**:
+  * **Dedicated AI & Antigravity Priority Pool**: Curates high-trust, Tier-1 nodes (SG, JP, US, CA, UK, DE, ES, CH, SE) and excludes dirty Anycast/CDN-fronted nodes (`172.64.*`, WeTV debug, etc.).
+  * **Anti-Location-Not-Supported Session Lock**: Uses sticky 15-minute intervals and 150ms tolerance tested directly against Google AI Studio (`https://aistudio.google.com`), preventing "impossible travel" country-hopping.
+  * **Strict Remote DoH for AI**: Routes all Google, Gemini, and AI domains strictly through encrypted DoH (`dns-remote-doh`), blocking local ISP DNS and EDNS Client Subnet (ECS) leaks.
+  * **Windows IPv6 Leak Blocker**: Enforces `ip_version: 6 -> block` so dual-stack Google domains cannot bypass the IPv4 TUN over physical Wi-Fi.
+  * **Dynamic Customer VPN Coexistence**: Detects FortiClient, Cisco AnyConnect, and GlobalProtect subnets and gateways dynamically from registry.
+  * **Non-Conflicting TUN Subnet**: Operates on `198.18.0.1/30` with MTU 1400 to avoid any overlap with corporate `172.16.0.0/12`.
+  * **Browser & Antigravity Protection**: Automatically rejects QUIC (UDP 443) and DoT (UDP 853) to force fast, reliable TCP TLS.
+  * **IPv4-Only DNS Strategy**: Eliminates DNS64 `64:ff9b::` timeout loops on cellular/IPv4 broadband connections.
+  * **VPN Hot-Reloading**: Monitors adapter changes in real-time, synchronizing routing tables automatically without restarting sing-box.
 * **Usage**: Double-click from Desktop or repository folder (automatically requests Administrator elevation).
 
 #### `connect-cluster.ps1`
 * **Purpose**: PowerShell execution of the cluster engine.
 * **Usage**:
   ```powershell
-  # Start cluster with automatic node discovery
+  # Start cluster with automatic node discovery & transparent TUN
   .\connect-cluster.ps1
+
+  # Run in Proxy-Only mode (mixed port 10808 without creating TUN adapter)
+  .\connect-cluster.ps1 -ProxyOnly
+
+  # Run with Windows System Proxy enabled
+  .\connect-cluster.ps1 -ProxyOnly -SystemProxy
   ```
 
 ---
 
-### 2. Per-Connection Round-Robin Rotator (Full Randomizer)
+### 2. Live Subscription Connector (Auto-Update Lifecycle & Corporate Shield)
+
+#### `Connect-Subscription.bat`
+* **Purpose**: One-click launcher for the live subscription connector. Connects directly to remote subscription URLs (Gists, Hiddify profiles, Sub-Store links) and automatically tracks daily key rotations.
+* **Features**:
+  * **Dual-Engine Architecture (Post-Quantum REALITY & Xray Bridge)**: Built-in support for **`xray.exe`** (v26.11.9) alongside **`sing-box.exe`**. When subscription links use modern Xray-core Reality servers requiring post-quantum hybrid key shares (`X25519MLKEM768`), the script transparently bridges them through an internal high-speed loopback bridge. This permanently eliminates the upstream `reality verification failed` error and guarantees 100% compatibility with all modern VPN seller keys!
+  * **Instant-On (Fast-Connect) & Background Best-Ping Switcher**: Never waits for dozens of dead servers to time out! Features a 1.2s rapid TCP pre-check and connects immediately as soon as the **first live node is verified** (under 2 seconds). After 60 seconds of uptime, a background benchmark scans the remaining nodes and automatically upgrades the active pool to **Best-Ping URL-Test mode**, seamlessly routing your traffic through the lowest-latency server without disconnecting your session!
+  * **Recursive Aggregator Resolution**: Automatically traverses nested subscription links (such as Mahsa collections, Sub-Store hubs, and Hiddify aggregators) that point to child subscription URLs.
+  * **Auto-Update Lifecycle (Hiddify / Sub-Store Standard)**: Reads `profile-update-interval` (e.g. every 1 hour) and monitors your remote subscription URLs. When the VPN admin updates keys, IPs, or UUIDs on the remote server, sing-box hot-reloads the new credentials in memory with zero downtime and zero manual conversion!
+  * **Corporate Shield (FortiClient & AnyConnect 100% Safe)**: Dedicated `dns-custvpn` adapter routing, corporate internal DNS rules, and process bypass ensures your corporate VPN, internal portals, and RDP sessions never drop, even if a public subscription key expires or drops.
+  * **Auto-Failover Pool (Resilience Guarantee)**: Tests subscription nodes with a live handshake probe. If a remote key drops or is blocked, it automatically merges verified fallback nodes from `config*.json` into the `urltest` pool so your laptop, browser, and Antigravity never lose internet access!
+  * **Transparent System TUN (`198.18.0.1/30`)**: Automatically captures system-wide traffic while keeping corporate subnets untouched.
+  * **Browser Safe**: Drops QUIC/DoT to force browsers to clean TCP TLS over the proxy.
+* **Usage**: Double-click `Connect-Subscription.bat` (automatically requests Administrator elevation).
+
+#### `connect-subscription.ps1`
+* **Purpose**: PowerShell execution of the subscription connector engine.
+* **Parameters**:
+  * `-SubscriptionFile <path>`: File containing subscription links (default: `subscriptions.txt`).
+  * `-Url <link>`: Connects directly to a specific subscription URL without modifying `subscriptions.txt`.
+  * `-ProxyOnly`: Runs mixed proxy (`127.0.0.1:10808`) without creating a TUN adapter.
+  * `-SystemProxy`: Sets Windows system proxy to `127.0.0.1:10808`.
+  * `-DisableFallbackPool`: Disables loading local fallback nodes if subscription nodes are down.
+* **Usage**:
+  ```powershell
+  # Connect using links in subscriptions.txt (TUN Mode)
+  .\connect-subscription.ps1
+
+  # Connect directly to a specific Gist/subscription URL
+  .\connect-subscription.ps1 -Url "https://gist.github.com/.../raw/ylt_onekey-stable"
+
+  # Run in Proxy-Only mode
+  .\connect-subscription.ps1 -ProxyOnly
+  ```
+
+#### `subscriptions.txt`
+* **Purpose**: Plain text list of remote subscription URLs (one link per line). Lines starting with `#` are treated as comments.
+* **Example**:
+  ```text
+  # Multip VPN - Remote Subscription Links
+  https://gist.github.com/yelinntunnn09/1b074d7640dc8799a2213593a3523d44/raw/ylt_onekey-stable
+  ```
+
+---
+
+### 3. Per-Connection Round-Robin Rotator (Full Randomizer)
 
 #### `Connect-Rotator.bat`
 * **Purpose**: Starts the **Hacker-Style Per-Connection Round-Robin Rotator**. Every single TCP connection exits through a different proxy node across different countries (Japan, Singapore, US, Canada, Germany, Spain, UK, etc.).
@@ -68,7 +132,7 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 
 ---
 
-### 3. Single VPN Connection
+### 4. Single VPN Connection
 
 #### `Connect-VPN.bat`
 * **Purpose**: Connects your computer to a single VPN configuration file (`config.json` by default).
@@ -84,24 +148,22 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
   .\connect-vpn.ps1
 
   # Connect to a specific file
-  .\connect-vpn.ps1 config04.json
+  .\connect-vpn.ps1 -ConfigFile "config02.json"
   ```
 
 ---
 
-### 3. Config Health Cleaner & Auto-Consolidator
+### 5. Config Health Cleaner & Auto-Consolidator
 
 #### `Clean-Configs.bat`
-* **Purpose**:
-  1. Backs up all `config*.json` files to `backups\backup_<timestamp>\`.
-  2. Tests every node with a real proxy handshake and HTTP 204 fetch.
-  3. Purges dead/expired keys and Antigravity-blocked countries (`HK`, `CN`, `RU`, `IR`, etc.).
-  4. Deduplicates identical nodes.
-  5. Merges **ALL surviving nodes into ONE master `config.json`** and cleans up secondary config files.
-* **Usage**: Double-click from Desktop or repository folder.
+* **Purpose**: 1-Click health check and pruner. Cleans dead, expired, and Antigravity-incompatible nodes across all `config*.json` files.
+* **Features**:
+  * **2-Stage Deduplication**: Drops duplicate nodes by exact signature (`Get-NodeSignature`) and by resolved `Protocol://IP:Port`.
+  * **16-Thread Parallel Probing**: Uses native `sing-box tools fetch` with a generous 9-second timeout to accommodate high-latency links.
+  * **Consolidation**: By default, merges all surviving nodes into `config.json` and purges redundant split files.
 
 #### `clean-configs.ps1`
-* **Purpose**: Advanced PowerShell options for cleaning.
+* **Purpose**: PowerShell execution of the cleaner engine.
 * **Parameters**:
   * `-DryRun`: Previews which nodes are alive/dead without modifying or deleting any files.
   * `-KeepSplit`: Cleans files in place without merging into `config.json`.
@@ -123,11 +185,11 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 
 ---
 
-### 4. Key to JSON Converter
+### 6. Key to JSON Converter
 
 #### `Convert-Keys.bat`
 * **Purpose**: Reads raw VPN share links from `key.txt` and converts them into sing-box config JSON.
-* **Supported Protocols**: `ss://`, `vless://`, `vmess://`, `trojan://`, `hysteria2://` / `hy2://`, `tuic://`, and Base64 subscription blobs.
+* **Supported Protocols**: `ss://`, `vless://` (Reality, WS, gRPC), `vmess://`, `trojan://`, `hysteria2://` / `hy2://`, `tuic://`, and Base64 subscription blobs.
 * **Usage**:
   * Double-click to convert `key.txt`.
   * Choose between:
@@ -141,7 +203,6 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
   * `-InputFile <path>`: Source text file containing links (default: `key.txt`).
   * `-OutputFile <path>`: Destination JSON file (auto-picks next available slot if omitted).
   * `-Split`: Splits each key into its own JSON file.
-  * `-NoTest`: Skips live latency probing after conversion.
 * **Usage**:
   ```powershell
   # Convert key.txt into a single bundled JSON file
@@ -156,7 +217,7 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 
 ---
 
-### 5. Config to Normal JSON Converter
+### 7. Config to Normal JSON Converter
 
 #### `Export-Normal-JSON.bat`
 * **Purpose**: Extracts real proxy nodes from any complex sing-box configuration (such as `_singbox_cluster_run.json` or any full TUN config) and exports them into clean, standard `{ "outbounds": [ ... ] }` JSON format just like your imported `config.json`.
@@ -184,7 +245,7 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 
 ---
 
-### 6. Emergency Network Clean & Factory Restoration (Reboot-Free)
+### 8. Emergency Network Clean & Factory Restoration (Reboot-Free)
 
 #### `Reset-Network.bat` / `reset-network.ps1`
 * **Purpose**: If a VPN session is stopped abruptly (e.g. terminal window closed without graceful Ctrl+C, or power loss), Windows may be left with orphan `/32` static routes, dead proxy settings, or hijacked DNS entries. This tool scrubs the entire Windows TCP/IP networking stack back to a clean, pristine post-reboot state in under 2 seconds **without needing to restart your computer**.
@@ -206,7 +267,7 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
 
 ---
 
-### 7. Setup & Binary Installation
+### 9. Setup & Binary Installation
 
 #### `install-singbox.ps1`
 * **Purpose**: Downloads and unpacks the official `sing-box.exe` Windows amd64 core binary from GitHub Releases into the project folder.
@@ -214,3 +275,16 @@ A high-performance transparent TUN VPN and load-balancing toolkit powered by `si
   ```powershell
   .\install-singbox.ps1
   ```
+
+---
+
+## Technical Highlights & Coexistence Architecture
+
+| Subsystem | Design & Implementation |
+| :--- | :--- |
+| **TUN Addressing** | `198.18.0.1/30` with MTU 1400. Avoids subnet conflicts with corporate VPN subnets (`172.16.0.0/12`) and prevents cellular packet fragmentation. |
+| **Customer VPN Isolation** | Dynamically discovers FortiClient/AnyConnect gateway `/32` addresses and corporate subnets from the Windows Registry and routes table. Bypasses VPN processes to physical Wi-Fi. |
+| **Corporate DNS Routing** | Dedicated `dns-custvpn` outbound bound to the customer VPN interface (`direct-vpn-0`). Internal corporate domains (`.corp`, `.internal`, `.lan`, single-label hostnames) are strictly routed through corporate DNS. |
+| **DoH DNS over Port 443** | All public internet DNS is resolved via `https://1.1.1.1/dns-query` through the proxy tunnel, bypassing ISP DNS poisoning. |
+| **QUIC & DoT Suppression** | Immediately rejects UDP 443 (QUIC) and UDP 853 (DoT) inside sing-box kernel, forcing Chromium/WebView2 browsers and Antigravity IDE to negotiate rock-solid TCP TLS. |
+| **IPv4-Only Strategy** | Enforces `ipv4_only` DNS strategy to eliminate DNS64 (`64:ff9b::`) latency penalties and connection timeouts. |
