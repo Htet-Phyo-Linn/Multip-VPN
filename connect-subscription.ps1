@@ -136,17 +136,26 @@ function Invoke-Cleanup {
         }
         $script:SingBoxProcess.Dispose()
         $script:SingBoxProcess = $null
-        Write-Ok "sing-box engine stopped (TUN adapter removed)."
     }
+    # Ensure all sing-box processes are terminated cleanly
+    Get-Process -Name "sing-box" -ErrorAction SilentlyContinue | ForEach-Object {
+        try { $_.Kill(); $_.WaitForExit(2000) | Out-Null } catch {}
+    }
+    Write-Ok "sing-box engine stopped (TUN adapter removed)."
 
+    # Stop Xray bridge engine and ensure all xray processes are terminated cleanly
+    Stop-XrayBridgeEngine
     if ($script:XrayProcess -ne $null) {
         if (-not $script:XrayProcess.HasExited) {
             try { $script:XrayProcess.Kill(); $script:XrayProcess.WaitForExit(2000) | Out-Null } catch {}
         }
         $script:XrayProcess.Dispose()
         $script:XrayProcess = $null
-        Write-Ok "Xray bridge engine stopped."
     }
+    Get-Process -Name "xray" -ErrorAction SilentlyContinue | ForEach-Object {
+        try { $_.Kill(); $_.WaitForExit(2000) | Out-Null } catch {}
+    }
+    Write-Ok "Xray bridge engine stopped."
 
     Remove-AllTrackedRoutes
     Remove-TrackedFwRules
@@ -375,11 +384,12 @@ function Parse-QueryString([string]$query) {
 
 # ── Node Parsers ────────────────────────────────────────────────────────────────
 function Parse-Vless([string]$uri, [string]$tag) {
-    if ($uri -match '^vless://([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(\?[^#]*)?$') {
-        $uuid   = $Matches[1]
-        $server = $Matches[2].Trim('[', ']')
-        $port   = [int]$Matches[3]
-        $q      = Parse-QueryString $Matches[4]
+    if ($uri -match '^vless://([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(?:/([^?#]*))?(?:\?([^#]*))?$') {
+        $uuid     = $Matches[1]
+        $server   = $Matches[2].Trim('[', ']')
+        $port     = [int]$Matches[3]
+        $pathPart = if ($Matches[4]) { "/" + $Matches[4].TrimStart('/') } else { "" }
+        $q        = Parse-QueryString $Matches[5]
         if (-not $tag) { $tag = "VLESS-$server`:$port" }
 
         $node = [ordered]@{
@@ -416,20 +426,23 @@ function Parse-Vless([string]$uri, [string]$tag) {
                 server_name = $sni
                 utls        = @{ enabled = $true; fingerprint = $fp }
             }
+            if ($q['insecure'] -eq "1" -or $q['insecure'] -eq "true" -or $q['allowInsecure'] -eq "1" -or $q['allowInsecure'] -eq "true") {
+                $node.tls["insecure"] = $true
+            }
         }
 
         # Transport (WS, gRPC, HTTP)
         $net = $q['type']
+        $effectivePath = if ($q['path']) { $q['path'] } elseif ($pathPart -and $pathPart -ne "/") { $pathPart } else { "/" }
         if ($net -eq "ws") {
-            $wsPath = if ($q['path']) { $q['path'] } else { "/" }
             $wsHost = if ($q['host']) { $q['host'] } else { $server }
             $node["transport"] = [ordered]@{
                 type    = "ws"
-                path    = $wsPath
+                path    = $effectivePath
                 headers = @{ Host = $wsHost }
             }
         } elseif ($net -eq "grpc") {
-            $srvName = if ($q['serviceName']) { $q['serviceName'] } else { "" }
+            $srvName = if ($q['serviceName']) { $q['serviceName'] } elseif ($effectivePath -ne "/") { $effectivePath } else { "" }
             $node["transport"] = [ordered]@{
                 type         = "grpc"
                 service_name = $srvName
@@ -441,34 +454,78 @@ function Parse-Vless([string]$uri, [string]$tag) {
     return $null
 }
 
+function Normalize-ShadowsocksMethod([string]$method) {
+    if (-not $method) { return "" }
+    $m = $method.Trim().ToLowerInvariant()
+    switch ($m) {
+        "chacha20-poly1305"      { return "chacha20-ietf-poly1305" }
+        "chacha20-ietf"          { return "chacha20-ietf-poly1305" }
+        "aead_chacha20_poly1305" { return "chacha20-ietf-poly1305" }
+        "aead_aes_128_gcm"       { return "aes-128-gcm" }
+        "aead_aes_256_gcm"       { return "aes-256-gcm" }
+        default                  { return $m }
+    }
+}
+
 function Parse-Shadowsocks([string]$uri, [string]$tag) {
-    if ($uri -match '^ss://([A-Za-z0-9+/=_-]+)@([^:/?#]+):(\d+)') {
-        $userInfo = Decode-Base64 $Matches[1]
-        $server   = $Matches[2]
-        $port     = [int]$Matches[3]
-        if ($userInfo -match '^([^:]+):(.*)$') {
+    $body = $uri.Substring(5) # strip 'ss://'
+    $server = ""; $port = 0; $method = ""; $pwd = ""
+
+    # SIP002 format: ss://base64(method:password)@server:port
+    if ($body -match '^([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)') {
+        $cred = Decode-Base64 $Matches[1]
+        $server = $Matches[2].Trim('[', ']')
+        $port = [int]$Matches[3]
+        if ($cred -match '^([^:]+):(.*)$') {
             $method = $Matches[1]
             $pwd    = $Matches[2]
-            if (-not $tag) { $tag = "SS-$server`:$port" }
-            return [ordered]@{
-                type        = "shadowsocks"
-                tag         = $tag
-                server      = $server
-                server_port = $port
-                method      = $method
-                password    = $pwd
+        }
+    } else {
+        # Legacy format: ss://base64(method:password@server:port)
+        $cleanBody = ($body -split '[/?#]')[0]
+        $dec = Decode-Base64 $cleanBody
+        if ($dec -match '^([^:]+):(.*)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)$') {
+            $method = $Matches[1]
+            $pwd    = $Matches[2]
+            $server = $Matches[3].Trim('[', ']')
+            $port   = [int]$Matches[4]
+        }
+    }
+
+    if ($server -and $port -and $method) {
+        $method = Normalize-ShadowsocksMethod $method
+        if (-not $tag) { $tag = "SS-$server`:$port" }
+        $node = [ordered]@{
+            type        = "shadowsocks"
+            tag         = $tag
+            server      = $server
+            server_port = $port
+            method      = $method
+            password    = $pwd
+        }
+        if ($body -match '\?([^#]+)') {
+            $q = Parse-QueryString $Matches[1]
+            if ($q['plugin']) {
+                $pRaw = [System.Uri]::UnescapeDataString($q['plugin'])
+                if ($pRaw -match '^([^;]+);?(.*)$') {
+                    $node['plugin'] = $Matches[1]
+                    if ($Matches[2]) { $node['plugin_opts'] = $Matches[2] }
+                } else {
+                    $node['plugin'] = $pRaw
+                }
             }
         }
+        return $node
     }
     return $null
 }
 
 function Parse-Hysteria2([string]$uri, [string]$tag) {
-    if ($uri -match '^(?:hysteria2|hy2)://([^@]+)@([^:/?#]+):(\d+)(\?[^#]*)?$') {
+    if ($uri -match '^(?:hysteria2|hy2)://([^@]+)@([^:/?#]+):(\d+)(?:/([^?#]*))?(?:\?([^#]*))?$') {
         $pwd    = $Matches[1]
         $server = $Matches[2]
         $port   = [int]$Matches[3]
-        $q      = Parse-QueryString $Matches[4]
+        $q      = Parse-QueryString $Matches[5]
         if (-not $tag) { $tag = "HY2-$server`:$port" }
 
         $node = [ordered]@{
@@ -483,7 +540,7 @@ function Parse-Hysteria2([string]$uri, [string]$tag) {
             enabled     = $true
             server_name = $sni
         }
-        if ($q['insecure'] -eq "1" -or $q['allowInsecure'] -eq "1") {
+        if ($q['insecure'] -eq "1" -or $q['insecure'] -eq "true" -or $q['allowInsecure'] -eq "1" -or $q['allowInsecure'] -eq "true") {
             $node["tls"]["insecure"] = $true
         }
         return $node
@@ -492,14 +549,14 @@ function Parse-Hysteria2([string]$uri, [string]$tag) {
 }
 
 function Parse-Trojan([string]$uri, [string]$tag) {
-    if ($uri -match '^trojan://([^@]+)@([^:/?#]+):(\d+)(\?[^#]*)?$') {
+    if ($uri -match '^trojan://([^@]+)@([^:/?#]+):(\d+)(?:/([^?#]*))?(?:\?([^#]*))?$') {
         $pwd    = $Matches[1]
         $server = $Matches[2]
         $port   = [int]$Matches[3]
-        $q      = Parse-QueryString $Matches[4]
+        $q      = Parse-QueryString $Matches[5]
         if (-not $tag) { $tag = "Trojan-$server`:$port" }
         $sni = if ($q['sni']) { $q['sni'] } else { $server }
-        return [ordered]@{
+        $trojanNode = [ordered]@{
             type        = "trojan"
             tag         = $tag
             server      = $server
@@ -507,6 +564,10 @@ function Parse-Trojan([string]$uri, [string]$tag) {
             password    = $pwd
             tls         = @{ enabled = $true; server_name = $sni }
         }
+        if ($q['insecure'] -eq "1" -or $q['insecure'] -eq "true" -or $q['allowInsecure'] -eq "1" -or $q['allowInsecure'] -eq "true") {
+            $trojanNode.tls["insecure"] = $true
+        }
+        return $trojanNode
     }
     return $null
 }
@@ -531,7 +592,13 @@ function Parse-Vmess([string]$uri, [string]$tag) {
                 }
                 if ($j.tls -eq "tls") {
                     $sni = if ($j.sni) { $j.sni } elseif ($j.host) { $j.host } else { $srv }
-                    $node["tls"] = @{ enabled = $true; server_name = $sni }
+                    $tlsMap = [ordered]@{ enabled = $true; server_name = $sni }
+                    if ($j.fp) { $tlsMap["utls"] = @{ enabled = $true; fingerprint = $j.fp } }
+                    if ($j.alpn) { $tlsMap["alpn"] = @($j.alpn -split ',') }
+                    if ($j.insecure -eq "1" -or $j.insecure -eq 1 -or $j.insecure -eq $true -or $j.allowInsecure -eq "1" -or $j.allowInsecure -eq 1 -or $j.allowInsecure -eq $true) {
+                        $tlsMap["insecure"] = $true
+                    }
+                    $node["tls"] = $tlsMap
                 }
                 if ($j.net -eq "ws") {
                     $node["transport"] = @{ type = "ws"; path = if ($j.path) { $j.path } else { "/" } }
@@ -1020,10 +1087,13 @@ function New-SubscriptionSingBoxConfig {
 
     foreach ($n in $Nodes) {
         $clean = Sanitize-NodeObj $n
-        $clean["bind_interface"] = $PhysicalGw.Name
-        $clean["domain_resolver"] = [pscustomobject]@{
-            server   = $wifiDnsTag
-            strategy = "ipv4_only"
+        $srv = if ($clean.server) { $clean.server.ToString().Trim() } else { "" }
+        if ($srv -ne "127.0.0.1" -and $srv -ne "localhost") {
+            $clean["bind_interface"] = $PhysicalGw.Name
+            $clean["domain_resolver"] = [pscustomobject]@{
+                server   = $wifiDnsTag
+                strategy = "ipv4_only"
+            }
         }
         $boundNodes.Add($clean)
     }
@@ -1308,6 +1378,13 @@ function Start-SingBoxEngine {
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host "   Multip VPN - Live Subscription Connector (Corporate Safe) 🌐" -ForegroundColor White
 Write-Host "================================================================" -ForegroundColor Cyan
+
+# Terminate any leftover sing-box or xray processes from earlier runs to free TUN adapter & ports
+$staleProcs = Get-Process -Name "sing-box", "xray" -ErrorAction SilentlyContinue
+if ($staleProcs) {
+    Write-Warn "Found leftover sing-box/xray process(es) from prior run -- terminating cleanly..."
+    $staleProcs | ForEach-Object { try { $_.Kill(); $_.WaitForExit(2000) | Out-Null } catch {} }
+}
 
 # Gather Subscription URLs
 $targetUrls = [System.Collections.Generic.List[string]]::new()

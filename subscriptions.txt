@@ -4,4 +4,3 @@
 
 https://gist.github.com/yelinntunnn09/1b074d7640dc8799a2213593a3523d44/raw/ylt_onekey-stable
 
-https://raw.githubusercontent.com/hiddify/hiddify-app/refs/heads/main/test.configs/mahsa#Mahsa

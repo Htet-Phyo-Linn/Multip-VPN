@@ -21,6 +21,10 @@
 
 .PARAMETER Split
     Saves each alive key into its own separate config file.
+
+.PARAMETER Insecure
+    Allows invalid, self-signed, or expired TLS certificates (sets tls.insecure = true).
+    Aliases: -Insecure, -AllowInsecure, -SkipCertVerify.
 #>
 
 param(
@@ -28,7 +32,9 @@ param(
     [string]$OutputFile,
     [switch]$Split,
     [int]$Threads = 16,
-    [int]$TimeoutMs = 5000
+    [int]$TimeoutMs = 5000,
+    [Alias("Insecure", "SkipCertVerify", "InsecureTls")]
+    [switch]$AllowInsecure
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -235,6 +241,19 @@ function Get-KeyLines([string]$filePath) {
 }
 
 # Protocol Parsers
+function Normalize-ShadowsocksMethod([string]$method) {
+    if (-not $method) { return "" }
+    $m = $method.Trim().ToLowerInvariant()
+    switch ($m) {
+        "chacha20-poly1305"      { return "chacha20-ietf-poly1305" }
+        "chacha20-ietf"          { return "chacha20-ietf-poly1305" }
+        "aead_chacha20_poly1305" { return "chacha20-ietf-poly1305" }
+        "aead_aes_128_gcm"       { return "aes-128-gcm" }
+        "aead_aes_256_gcm"       { return "aes-256-gcm" }
+        default                  { return $m }
+    }
+}
+
 function Parse-Shadowsocks([string]$uri, [string]$tag) {
     $body = $uri.Substring(5) # strip 'ss://'
     $server = ""; $port = 0; $method = ""; $password = ""
@@ -261,8 +280,9 @@ function Parse-Shadowsocks([string]$uri, [string]$tag) {
     }
 
     if ($server -and $port -and $method) {
+        $method = Normalize-ShadowsocksMethod $method
         if (-not $tag) { $tag = "SS-$server`:$port" }
-        return [ordered]@{
+        $node = [ordered]@{
             type        = "shadowsocks"
             tag         = $tag
             server      = $server
@@ -270,17 +290,34 @@ function Parse-Shadowsocks([string]$uri, [string]$tag) {
             method      = $method
             password    = $password
         }
+
+        # SIP003 / SIP002 Plugin support
+        if ($body -match '\?([^#]+)') {
+            $q = Parse-QueryString $Matches[1]
+            if ($q['plugin']) {
+                $pRaw = [System.Uri]::UnescapeDataString($q['plugin'])
+                if ($pRaw -match '^([^;]+);?(.*)$') {
+                    $node['plugin'] = $Matches[1]
+                    if ($Matches[2]) { $node['plugin_opts'] = $Matches[2] }
+                } else {
+                    $node['plugin'] = $pRaw
+                }
+            }
+        }
+
+        return $node
     }
     return $null
 }
 
 function Parse-Vless([string]$uri, [string]$tag) {
-    # vless://uuid@server:port?query
-    if ($uri -match '^vless://([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(\?[^#]*)?$') {
-        $uuid   = $Matches[1]
-        $server = $Matches[2].Trim('[', ']')
-        $port   = [int]$Matches[3]
-        $q      = Parse-QueryString $Matches[4]
+    # vless://uuid@server:port?query or vless://uuid@server:port/?query or vless://uuid@server:port/path?query
+    if ($uri -match '^vless://([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(?:/([^?#]*))?(?:\?([^#]*))?$') {
+        $uuid     = $Matches[1]
+        $server   = $Matches[2].Trim('[', ']')
+        $port     = [int]$Matches[3]
+        $pathPart = if ($Matches[4]) { "/" + $Matches[4].TrimStart('/') } else { "" }
+        $q        = Parse-QueryString $Matches[5]
 
         if (-not $tag) { $tag = "VLESS-$server`:$port" }
 
@@ -321,6 +358,9 @@ function Parse-Vless([string]$uri, [string]$tag) {
             if ($q['fp']) {
                 $node.tls["utls"] = @{ enabled = $true; fingerprint = $q['fp'] }
             }
+            if ($AllowInsecure -or $q['insecure'] -eq "1" -or $q['insecure'] -eq "true" -or $q['allowInsecure'] -eq "1" -or $q['allowInsecure'] -eq "true") {
+                $node.tls["insecure"] = $true
+            }
             if ($q['alpn']) {
                 # If transport is ws or httpupgrade, do NOT enforce h2/h3 ALPN
                 # as that breaks standard WebSocket TLS handshakes on CDN fronts!
@@ -332,26 +372,29 @@ function Parse-Vless([string]$uri, [string]$tag) {
             }
         }
 
+        # Resolve transport path
+        $effectivePath = if ($q['path']) { $q['path'] } elseif ($pathPart -and $pathPart -ne "/") { $pathPart } else { "" }
+
         # Transport: ws, grpc, http, httpupgrade, tcp
         $type = $q['type']
         if ($type -eq "ws") {
             $ws = [ordered]@{ type = "ws" }
-            if ($q['path']) { $ws["path"] = $q['path'] }
+            if ($effectivePath) { $ws["path"] = $effectivePath }
             if ($q['host']) { $ws["headers"] = @{ Host = $q['host'] } }
             $node["transport"] = $ws
         } elseif ($type -eq "grpc") {
             $grpc = [ordered]@{ type = "grpc" }
-            $svc = if ($q['serviceName']) { $q['serviceName'] } else { $q['path'] }
+            $svc = if ($q['serviceName']) { $q['serviceName'] } elseif ($effectivePath) { $effectivePath } else { "" }
             if ($svc) { $grpc["service_name"] = $svc }
             $node["transport"] = $grpc
         } elseif ($type -eq "httpupgrade") {
             $hu = [ordered]@{ type = "httpupgrade" }
-            if ($q['path']) { $hu["path"] = $q['path'] }
+            if ($effectivePath) { $hu["path"] = $effectivePath }
             if ($q['host']) { $hu["host"] = $q['host'] }
             $node["transport"] = $hu
         } elseif ($type -eq "http") {
             $tr = [ordered]@{ type = "http" }
-            if ($q['path']) { $tr["path"] = $q['path'] }
+            if ($effectivePath) { $tr["path"] = $effectivePath }
             if ($q['host']) { $tr["host"] = @($q['host'] -split ',') }
             $node["transport"] = $tr
         }
@@ -392,6 +435,19 @@ function Parse-Vmess([string]$uri, [string]$tag) {
                 enabled     = $true
                 server_name = $sni
             }
+            if ($v.fp) {
+                $node.tls["utls"] = @{ enabled = $true; fingerprint = $v.fp }
+            }
+            if ($v.alpn) {
+                if ($v.net -in @("ws", "httpupgrade")) {
+                    $node.tls["alpn"] = @("http/1.1")
+                } else {
+                    $node.tls["alpn"] = @($v.alpn -split ',')
+                }
+            }
+            if ($AllowInsecure -or $v.insecure -eq "1" -or $v.insecure -eq 1 -or $v.insecure -eq $true -or $v.allowInsecure -eq "1" -or $v.allowInsecure -eq 1 -or $v.allowInsecure -eq $true) {
+                $node.tls["insecure"] = $true
+            }
         }
 
         # Transport
@@ -421,12 +477,13 @@ function Parse-Vmess([string]$uri, [string]$tag) {
 }
 
 function Parse-Trojan([string]$uri, [string]$tag) {
-    # trojan://password@server:port?query
-    if ($uri -match '^trojan://([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(\?[^#]*)?$') {
+    # trojan://password@server:port?query or trojan://password@server:port/?query
+    if ($uri -match '^trojan://([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(?:/([^?#]*))?(?:\?([^#]*))?$') {
         $password = $Matches[1]
         $server   = $Matches[2].Trim('[', ']')
         $port     = [int]$Matches[3]
-        $q        = Parse-QueryString $Matches[4]
+        $pathPart = if ($Matches[4]) { "/" + $Matches[4].TrimStart('/') } else { "" }
+        $q        = Parse-QueryString $Matches[5]
 
         if (-not $tag) { $tag = "Trojan-$server`:$port" }
 
@@ -444,19 +501,26 @@ function Parse-Trojan([string]$uri, [string]$tag) {
             }
         }
 
+        if ($q['fp']) { $node.tls["utls"] = @{ enabled = $true; fingerprint = $q['fp'] } }
+        if ($AllowInsecure -or $q['insecure'] -eq "1" -or $q['insecure'] -eq "true" -or $q['allowInsecure'] -eq "1" -or $q['allowInsecure'] -eq "true") {
+            $node.tls["insecure"] = $true
+        }
         if ($q['alpn']) { $node.tls["alpn"] = @($q['alpn'] -split ',') }
 
+        $effectivePath = if ($q['path']) { $q['path'] } elseif ($pathPart -and $pathPart -ne "/") { $pathPart } else { "" }
         $type = $q['type']
         if ($type -eq "ws") {
             $ws = [ordered]@{ type = "ws" }
-            if ($q['path']) { $ws["path"] = $q['path'] }
+            if ($effectivePath) { $ws["path"] = $effectivePath }
             if ($q['host']) { $ws["headers"] = @{ Host = $q['host'] } }
             $node["transport"] = $ws
         } elseif ($type -eq "grpc") {
-            $svc = if ($q['serviceName']) { $q['serviceName'] } else { $q['path'] }
-            $node["transport"] = [ordered]@{
-                type         = "grpc"
-                service_name = $svc
+            $svc = if ($q['serviceName']) { $q['serviceName'] } elseif ($effectivePath) { $effectivePath } else { "" }
+            if ($svc) {
+                $node["transport"] = [ordered]@{
+                    type         = "grpc"
+                    service_name = $svc
+                }
             }
         }
 
@@ -467,11 +531,11 @@ function Parse-Trojan([string]$uri, [string]$tag) {
 
 function Parse-Hysteria2([string]$uri, [string]$tag) {
     # hysteria2://password@server:port?query or hy2://
-    if ($uri -match '^(?:hysteria2|hy2)://([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(\?[^#]*)?$') {
+    if ($uri -match '^(?:hysteria2|hy2)://([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(?:/([^?#]*))?(?:\?([^#]*))?$') {
         $password = $Matches[1]
         $server   = $Matches[2].Trim('[', ']')
         $port     = [int]$Matches[3]
-        $q        = Parse-QueryString $Matches[4]
+        $q        = Parse-QueryString $Matches[5]
 
         if (-not $tag) { $tag = "Hy2-$server`:$port" }
 
@@ -489,7 +553,7 @@ function Parse-Hysteria2([string]$uri, [string]$tag) {
             }
         }
 
-        if ($q['insecure'] -eq "1" -or $q['insecure'] -eq "true") {
+        if ($AllowInsecure -or $q['insecure'] -eq "1" -or $q['insecure'] -eq "true" -or $q['allowInsecure'] -eq "1" -or $q['allowInsecure'] -eq "true") {
             $node.tls["insecure"] = $true
         }
 
@@ -509,12 +573,12 @@ function Parse-Hysteria2([string]$uri, [string]$tag) {
 
 function Parse-Tuic([string]$uri, [string]$tag) {
     # tuic://uuid:password@server:port?query
-    if ($uri -match '^tuic://([^:]+):([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(\?[^#]*)?$') {
+    if ($uri -match '^tuic://([^:]+):([^@]+)@(\[[a-fA-F0-9:]+\]|[^:/?#]+):(\d+)(?:/([^?#]*))?(?:\?([^#]*))?$') {
         $uuid     = $Matches[1]
         $password = $Matches[2]
         $server   = $Matches[3].Trim('[', ']')
         $port     = [int]$Matches[4]
-        $q        = Parse-QueryString $Matches[5]
+        $q        = Parse-QueryString $Matches[6]
 
         if (-not $tag) { $tag = "TUIC-$server`:$port" }
 
@@ -719,19 +783,73 @@ if (Test-Path $SingBoxBin) {
                         $aliveCollector.Add($job.Node)
                         Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> ALIVE ({4}ms) [KEPT]" -f $job.Index, $totalCandidates, $job.Node.type, $job.Node.tag, $elapsed) -ForegroundColor Green
                     } else {
-                        $deadCount++
-                        $err = $errText
-                        if ($err -match "status code: (\d+)") {
-                            $err = "Auth error (HTTP $($Matches[1]))"
-                        } elseif ($err -match "EOF") {
-                            $err = "Server dropped connection (EOF)"
-                        } elseif ($err -match "refused") {
-                            $err = "Connection refused"
-                        } elseif ($err -match "reality verification failed") {
-                            $err = "Reality handshake failed"
+                        # Auto-recovery for expired or self-signed TLS certificates
+                        $certFailed = ($errText -match "certificate has expired" -or 
+                                       $errText -match "failed to verify certificate" -or 
+                                       $errText -match "cannot validate certificate" -or
+                                       $errText -match "x509: certificate")
+
+                        $recovered = $false
+                        if ($certFailed -and $job.Node.tls -and (-not $job.Node.tls.insecure)) {
+                            $reprobeTmp = Join-Path $env:TEMP ("sb_conv_reprobe_" + [Guid]::NewGuid().ToString("N") + ".json")
+                            $reClone = ($job.Node | ConvertTo-Json -Depth 10) | ConvertFrom-Json
+                            $reClone.tag = "reprobe"
+                            if (-not $reClone.tls) {
+                                $reClone | Add-Member -NotePropertyName "tls" -NotePropertyValue ([PSCustomObject]@{ enabled = $true; insecure = $true }) -Force
+                            } else {
+                                $reClone.tls | Add-Member -NotePropertyName "insecure" -NotePropertyValue $true -Force
+                            }
+                            $rePConfig = @{
+                                log = @{ level = "error" }
+                                outbounds = @($reClone)
+                            }
+                            [System.IO.File]::WriteAllText($reprobeTmp, ($rePConfig | ConvertTo-Json -Depth 10), $utf8NoBom)
+                            
+                            $rePinfo = New-Object System.Diagnostics.ProcessStartInfo
+                            $rePinfo.FileName = $SingBoxBin
+                            $rePinfo.Arguments = "tools fetch https://www.gstatic.com/generate_204 -c `"$reprobeTmp`" -o reprobe"
+                            $rePinfo.RedirectStandardOutput = $true
+                            $rePinfo.RedirectStandardError = $true
+                            $rePinfo.UseShellExecute = $false
+                            $rePinfo.CreateNoWindow = $true
+
+                            $reSw = [System.Diagnostics.Stopwatch]::StartNew()
+                            $reProc = [System.Diagnostics.Process]::Start($rePinfo)
+                            $reFinished = $reProc.WaitForExit(3500)
+                            $reSw.Stop()
+                            
+                            $reExit = if ($reFinished) { $reProc.ExitCode } else { -1 }
+                            if (-not $reFinished) { try { $reProc.Kill() } catch {} }
+                            $reProc.Dispose()
+                            Remove-Item $reprobeTmp -Force -ErrorAction SilentlyContinue
+
+                            if ($reExit -eq 0) {
+                                $job.Node.tls["insecure"] = $true
+                                $aliveCollector.Add($job.Node)
+                                $recovered = $true
+                                Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> ALIVE ({4}ms) [KEPT: Server cert expired -> auto-bypassed]" -f $job.Index, $totalCandidates, $job.Node.type, $job.Node.tag, $reSw.ElapsedMilliseconds) -ForegroundColor Green
+                            }
                         }
-                        if (-not $err) { $err = "Failed" }
-                        Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD ({4}) [DROPPED]" -f $job.Index, $totalCandidates, $job.Node.type, $job.Node.tag, $err) -ForegroundColor Yellow
+
+                        if (-not $recovered) {
+                            $deadCount++
+                            $err = $errText
+                            if ($err -match "status code: (\d+)") {
+                                $err = "Auth error (HTTP $($Matches[1]))"
+                            } elseif ($err -match "EOF") {
+                                $err = "Server dropped connection (EOF)"
+                            } elseif ($err -match "refused") {
+                                $err = "Connection refused"
+                            } elseif ($err -match "reality verification failed") {
+                                $err = "Reality handshake failed"
+                            } elseif ($err -match "certificate has expired") {
+                                $err = "Server TLS certificate expired (Try -AllowInsecure)"
+                            } elseif ($err -match "cannot validate certificate") {
+                                $err = "TLS certificate mismatch (Try -AllowInsecure)"
+                            }
+                            if (-not $err) { $err = "Failed" }
+                            Write-Host ("  [{0}/{1}] {2,-10} '{3}' -> DEAD ({4}) [DROPPED]" -f $job.Index, $totalCandidates, $job.Node.type, $job.Node.tag, $err) -ForegroundColor Yellow
+                        }
                     }
                 } elseif ($elapsed -gt $timeoutMs) {
                     $sw.Stop()

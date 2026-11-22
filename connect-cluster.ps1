@@ -1480,6 +1480,7 @@ if (-not $started) {
 }
 
 Write-Ok "sing-box Cluster is ACTIVE (PID: $($SingBoxProcess.Id))"
+try { Clear-DnsClientCache } catch {}
 
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Green
