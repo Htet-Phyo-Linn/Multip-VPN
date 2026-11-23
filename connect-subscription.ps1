@@ -1513,8 +1513,8 @@ if ($pendingSubNodes.Count -gt 0) {
 $finalNodesPool = [System.Collections.Generic.List[object]]::new()
 foreach ($an in $aliveSubNodes) { $finalNodesPool.Add($an) }
 
-if (-not $DisableFallbackPool -and ($finalNodesPool.Count -eq 0 -or $finalNodesPool.Count -lt 3)) {
-    Write-Info "Loading verified fallback cluster pool to guarantee 100% uptime..."
+if (-not $DisableFallbackPool -and $finalNodesPool.Count -eq 0) {
+    Write-Info "Subscription node unreachable -- loading verified fallback cluster pool to guarantee 100% uptime..."
     $localFallbacks = Get-LocalFallbackNodes -Folder $ScriptDir
     $addedFallbacks = 0
     foreach ($fn in $localFallbacks) {

@@ -1,5 +1,5 @@
 # Binaries
-sing-box.exe
+# (sing-box.exe and xray.exe are tracked in repository)
 
 # Private credentials & Keys
 key.txt
@@ -11,6 +11,7 @@ key.txt
 config*.json
 normal*.json
 !config.example.json
+vpn file/
 
 # Runtime dynamic files & cache
 _singbox*.json

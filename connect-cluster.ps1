@@ -1082,9 +1082,24 @@ function New-SingBoxClusterConfig {
         url                         = "https://www.gstatic.com/generate_204"
         interval                    = "3m"
         idle_timeout                = "10m"
-        tolerance                   = 50
+        tolerance                   = 150
         interrupt_exist_connections = $false
     })
+
+    # Dedicated Streaming Pool: Pre-sorted low-ping nodes with 150ms tolerance to prevent exit IP flapping during YouTube video playback
+    $streamingTags = @($allNodeTags | Select-Object -First 4)
+    if ($streamingTags.Count -gt 0) {
+        $clusterGroups.Add([pscustomobject]@{
+            type                        = "urltest"
+            tag                         = "🎥 YouTube & Streaming Pool"
+            outbounds                   = @($streamingTags)
+            url                         = "https://www.gstatic.com/generate_204"
+            interval                    = "5m"
+            idle_timeout                = "15m"
+            tolerance                   = 150
+            interrupt_exist_connections = $false
+        })
+    }
 
     if ($hyTags.Count -gt 0) {
         $clusterGroups.Add([pscustomobject]@{
@@ -1094,7 +1109,7 @@ function New-SingBoxClusterConfig {
             url                         = "https://www.gstatic.com/generate_204"
             interval                    = "3m"
             idle_timeout                = "5m"
-            tolerance                   = 50
+            tolerance                   = 150
             interrupt_exist_connections = $false
         })
     }
@@ -1107,7 +1122,7 @@ function New-SingBoxClusterConfig {
             url                         = "https://www.gstatic.com/generate_204"
             interval                    = "3m"
             idle_timeout                = "5m"
-            tolerance                   = 50
+            tolerance                   = 150
             interrupt_exist_connections = $false
         })
     }
@@ -1120,7 +1135,7 @@ function New-SingBoxClusterConfig {
             url                         = "https://www.gstatic.com/generate_204"
             interval                    = "3m"
             idle_timeout                = "5m"
-            tolerance                   = 50
+            tolerance                   = 150
             interrupt_exist_connections = $false
         })
     }
@@ -1355,6 +1370,18 @@ function New-SingBoxClusterConfig {
             $routeRules.Add([pscustomobject]@{ domain_suffix = @($custDomainRules); outbound = $custDnsTag })
         }
         $routeRules.Add([pscustomobject]@{ domain_regex = @("^[^.]+$"); outbound = $custDnsTag })
+    }
+
+    # Route YouTube & Google Video streaming domains to the stable streaming pool (eliminates IP switching / 403 chunk drops)
+    $streamingDomains = @(
+        "youtube.com", "googlevideo.com", "ytimg.com", "youtu.be",
+        "youtubei.googleapis.com", "yt3.ggpht.com", "yt4.ggpht.com"
+    )
+    if ($streamingTags.Count -gt 0) {
+        $routeRules.Add([pscustomobject]@{
+            domain_suffix = @($streamingDomains)
+            outbound      = "🎥 YouTube & Streaming Pool"
+        })
     }
 
     $routeRules.Add([pscustomobject]@{
