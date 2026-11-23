@@ -10,6 +10,7 @@ key.txt
 # VPN Configurations (contains private keys/uuids)
 config*.json
 normal*.json
+vpn_file*.json
 !config.example.json
 vpn file/
 
