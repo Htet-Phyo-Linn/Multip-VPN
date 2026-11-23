@@ -6,6 +6,9 @@ key.txt
 *.key
 *.pem
 *.crt
+.env
+*.session
+*.session-journal
 
 # VPN Configurations (contains private keys/uuids)
 config*.json

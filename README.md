@@ -26,7 +26,7 @@ It features automatic key conversion, live proxy health verification, Antigravit
 | **`connect-subscription.ps1`** | **Live Subscription Engine**: Auto-fetches Gist / Base64 / Sub-Store links from `subscriptions.txt`, bridges Xray Reality nodes, hot-reloads key changes (or single fetch with `-Pause`), and supports instant-connect. |
 | **`clean-configs.ps1`** | **Health Checker & Consolidator**: 16-thread parallel probe test, removes dead/expired nodes, filters blocked regions, purges Google Cloud IPs (`-gcp` / `-gpc`), and consolidates surviving nodes into `config.json`. |
 | **`convert-keys.ps1`** | **Key to JSON Converter**: Converts raw links (SS, VLESS Reality/WS, VMess, Trojan, Hy2, TUIC) or Base64 bundles from `key.txt` into validated sing-box JSON. |
-| **`extract-vpn-files.ps1`** | **VPN File Extractor**: Scans injector & tunnel files (`vpn file/`), parses decrypted HTTP Custom, Dark Tunnel (`.dark`), SSH, and embedded links, and exports compliant sing-box JSON (`vpn_file_01.json`). |
+| **`scrape-telegram.py`** | **Telegram Scraper & Extractor**: Connects to `@decrypt_file_vpn` with session check & time-range filter (`-d 3`), downloads decrypted files, extracts SSH/VLESS/DarkTunnel, and exports `vpn_file_01.json`. |
 | **`reset-network.ps1`** | **Emergency Network Restoration**: Reboot-free cleanup that flushes DNS/ARP, clears virtual TUN adapters, removes lingering static routes, and resets proxy/firewall rules. |
 | **`subscriptions.txt`** | Plain text list of remote subscription URLs (Gist, Hiddify, Sub-Store, Clash, or raw share links) to auto-fetch and monitor. |
 | **`sing-box.exe`** | Core transparent proxy & TUN routing engine (bundled). |
@@ -110,23 +110,33 @@ Paste your share links (`ss://`, `vless://`, `vmess://`, `trojan://`, `hysteria2
 .\convert-keys.ps1 -InputFile "custom_keys.txt" -OutputFile "config.json"
 ```
 
-### 4. Extracting from VPN Injector Files (`extract-vpn-files.ps1`)
-Extracts proxy outbounds from injector and tunnel files stored in `vpn file/` (including decrypted HTTP Custom / SP-DECODE JSON, Dark Tunnel `.dark` base64 configs, direct SSH credentials, and embedded share links):
+### 4. Telegram Scraper & Extractor (`scrape-telegram.py`)
+Connects to Telegram (`@decrypt_file_vpn` or custom groups), downloads files within a specified time range, and directly extracts all proxy outbounds into standard sing-box `vpn_file_01.json`:
 
 ```powershell
-# Extract all valid nodes from 'vpn file/' into 'vpn_file_01.json'
-.\extract-vpn-files.ps1
+# 1. Check if Telegram session is authorized
+python scrape-telegram.py --check-login
 
-# Extract to a specific output file or config slot
-.\extract-vpn-files.ps1 -OutputFile "vpn_file_01.json"
-.\extract-vpn-files.ps1 -OutputFile "config03.json"
+# 2. Login interactively (run once to create telegram_session)
+python scrape-telegram.py --login
 
-# Scan a custom folder
-.\extract-vpn-files.ps1 -Folder "D:\custom\vpn\files" -OutputFile "vpn_file_01.json"
+# 3. Scrape Telegram group for the last 3 days and export vpn_file_01.json
+python scrape-telegram.py -d 3
+
+# 4. Scrape the last 24 hours to a custom file
+python scrape-telegram.py -d 1 -o vpn_file_01.json
+
+# 5. Extract local files in 'vpn file/' without scraping Telegram
+python scrape-telegram.py --extract-only
 ```
 
-> [!NOTE]
-> Proprietary encrypted formats (`.hc`, `.ehi`, `.npvs`, `.ssc`, `.nm`, `.ar`) are encrypted Android APK containers. Once unlocked via a decryption bot (such as Telegram `@decrypt_file_vpn` or `@syuw3n`), save the decrypted `.txt` result file into `vpn file/` and run `.\extract-vpn-files.ps1` to extract them automatically.
+#### Supported Scraper Flags
+- **`-d <float>` / `--days <float>`**: Time range in days to scrape (default: `3`). The script scans newest messages first and stops once it reaches the cutoff date.
+- **`-o <path>` / `--output <path>`**: Destination sing-box JSON file (default: `vpn_file_01.json`).
+- **`--check-login`**: Verifies whether the stored Telegram session is valid without starting a scrape.
+- **`--login`**: Starts interactive login prompting for phone number and Telegram verification code.
+- **`--extract-only`**: Parses existing files in `vpn file/` without connecting to Telegram.
+- **`--target <handle>`**: Telegram group or channel handle (default: `decrypt_file_vpn`).
 
 ### 5. Cleaning & Auditing Configs
 Tests all candidate nodes across existing config files, filters out dead or blocked nodes, and merges working ones:
