@@ -25,6 +25,7 @@ It features automatic key conversion, live proxy health verification, Antigravit
 | **`connect-cluster.ps1`** | **Load-Balanced Cluster**: Aggregates all nodes across your configs, runs parallel health checks, builds transparent TUN, and balances traffic via lowest ping. |
 | **`connect-subscription.ps1`** | **Live Subscription Engine**: Auto-fetches Gist / Base64 / Sub-Store links from `subscriptions.txt`, bridges Xray Reality nodes, hot-reloads key changes (or single fetch with `-Pause`), and supports instant-connect. |
 | **`clean-configs.ps1`** | **Health Checker & Consolidator**: 16-thread parallel probe test, removes dead/expired nodes, filters blocked regions, purges Google Cloud IPs (`-gcp` / `-gpc`), and consolidates surviving nodes into `config.json`. |
+| **`check-scraped.ps1`** | **Scraped Node Live Checker**: Standalone 16-thread connectivity & ping tester for scraped JSON files (`vpn_file_01.json`). Diagnostic check without touching `config.json` or deleting files. Supports `-OutFile`, `-Prune`, and `-SortByLatency`. |
 | **`convert-keys.ps1`** | **Key to JSON Converter**: Converts raw links (SS, VLESS Reality/WS, VMess, Trojan, Hy2, TUIC) or Base64 bundles from `key.txt` into validated sing-box JSON. |
 | **`scrape-telegram.py`** | **Telegram Scraper & Extractor**: Connects to `@decrypt_file_vpn` with session check & time-range filter (`-d 3`), downloads decrypted files, extracts SSH/VLESS/DarkTunnel, and exports `vpn_file_01.json`. |
 | **`reset-network.ps1`** | **Emergency Network Restoration**: Reboot-free cleanup that flushes DNS/ARP, clears virtual TUN adapters, removes lingering static routes, and resets proxy/firewall rules. |
@@ -138,7 +139,41 @@ python scrape-telegram.py --extract-only
 - **`--extract-only`**: Parses existing files in `vpn file/` without connecting to Telegram.
 - **`--target <handle>`**: Telegram group or channel handle (default: `decrypt_file_vpn`).
 
-### 5. Cleaning & Auditing Configs
+### 5. Live Checking Scraped VPN Files (`check-scraped.ps1`)
+Dedicated multi-threaded connectivity and latency tester specifically built for scraped files (like `vpn_file_01.json`). Unlike `clean-configs.ps1`, it **does not** touch `config.json`, does not delete secondary configs, and operates purely as a safe diagnostic tool unless instructed to export or prune:
+
+```powershell
+# 1. Quick diagnostic check of vpn_file_01.json (read-only, no file changes)
+.\check-scraped.ps1
+
+# 2. Check and save only verified ALIVE nodes into a separate JSON file
+.\check-scraped.ps1 -OutFile vpn_file_01_live.json
+
+# 3. Sort surviving nodes from lowest ping to highest ping
+.\check-scraped.ps1 -OutFile vpn_file_01_live.json -SortByLatency
+
+# 4. Prune dead nodes in-place (creates safety backup .bak first)
+.\check-scraped.ps1 -Prune
+
+# 5. Check a custom scraped file with custom timeout and thread count
+.\check-scraped.ps1 custom_vpn.json -Threads 20 -TimeoutMs 5000
+
+# 6. Check and immediately launch cluster connection with surviving nodes
+.\check-scraped.ps1 -OutFile config_scraped.json -Connect
+```
+
+#### Supported Live-Check Parameters
+- **`[string]$File`** (Position 0): Path to the scraped JSON file (default: `vpn_file_01.json`).
+- **`-OutFile <path>`**: Exports only surviving, verified ALIVE nodes to a new sing-box JSON file.
+- **`-Prune`**: Overwrites the input file in place with only the verified alive nodes (automatically makes a `.bak` backup first).
+- **`-SortByLatency`**: Orders surviving nodes from fastest to slowest ping before saving.
+- **`-Threads <int>`**: Parallel probe concurrency (default: `16`).
+- **`-TimeoutMs <int>`**: Probe timeout per node in milliseconds (default: `6000`).
+- **`-TestUrl <string>`**: Endpoint to fetch through each node (default: `https://www.gstatic.com/generate_204`).
+- **`-NoGeo`**: Skips GeoIP lookups to maximize test speed.
+- **`-Connect`**: Automatically launches `connect-cluster.ps1` with the alive nodes upon test completion.
+
+### 6. Cleaning & Auditing Configs
 Tests all candidate nodes across existing config files, filters out dead or blocked nodes, and merges working ones:
 
 ```powershell
@@ -161,7 +196,7 @@ Tests all candidate nodes across existing config files, filters out dead or bloc
 - **`-KeepSplit`**: Cleans and validates nodes inside individual config files without merging them into master `config.json`.
 - **`-TargetFile <name>`**: Targets a specific JSON file (e.g. `config02.json`).
 
-### 6. Emergency Network Reset
+### 7. Emergency Network Reset
 If a terminal is closed abruptly or a network glitch leaves lingering routing rules:
 
 ```powershell
