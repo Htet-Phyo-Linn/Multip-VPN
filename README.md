@@ -23,8 +23,8 @@ It features automatic key conversion, live proxy health verification, Antigravit
 | Script / File | Purpose |
 | :--- | :--- |
 | **`connect-cluster.ps1`** | **Load-Balanced Cluster**: Aggregates all nodes across your configs, runs parallel health checks, builds transparent TUN, and balances traffic via lowest ping. |
-| **`connect-subscription.ps1`** | **Live Subscription Engine**: Auto-fetches Gist / Base64 / Sub-Store links from `subscriptions.txt`, bridges Xray Reality nodes, hot-reloads key changes, and supports instant-connect. |
-| **`clean-configs.ps1`** | **Health Checker & Consolidator**: 16-thread parallel probe test, removes dead/expired nodes, filters blocked regions, and consolidates surviving nodes into `config.json`. |
+| **`connect-subscription.ps1`** | **Live Subscription Engine**: Auto-fetches Gist / Base64 / Sub-Store links from `subscriptions.txt`, bridges Xray Reality nodes, hot-reloads key changes (or single fetch with `-Pause`), and supports instant-connect. |
+| **`clean-configs.ps1`** | **Health Checker & Consolidator**: 16-thread parallel probe test, removes dead/expired nodes, filters blocked regions, purges Google Cloud IPs (`-gcp` / `-gpc`), and consolidates surviving nodes into `config.json`. |
 | **`convert-keys.ps1`** | **Key to JSON Converter**: Converts raw links (SS, VLESS Reality/WS, VMess, Trojan, Hy2, TUIC) or Base64 bundles from `key.txt` into validated sing-box JSON. |
 | **`reset-network.ps1`** | **Emergency Network Restoration**: Reboot-free cleanup that flushes DNS/ARP, clears virtual TUN adapters, removes lingering static routes, and resets proxy/firewall rules. |
 | **`subscriptions.txt`** | Plain text list of remote subscription URLs (Gist, Hiddify, Sub-Store, Clash, or raw share links) to auto-fetch and monitor. |
@@ -69,8 +69,11 @@ Starts the multi-node load-balanced cluster with dedicated pools for general tra
 Fetches subscription links defined in `subscriptions.txt`, performs rapid pre-checks, bridges Xray keys if needed, and starts the tunnel.
 
 ```powershell
-# Connect using URLs from subscriptions.txt
+# Connect using URLs from subscriptions.txt (auto-update lifecycle active)
 .\connect-subscription.ps1
+
+# Connect with -Pause (fetches keys once at startup, disables recurring background interval polling)
+.\connect-subscription.ps1 -Pause
 
 # Connect directly to a specific subscription URL
 .\connect-subscription.ps1 -Url "https://gist.github.com/.../raw/your-sub"
@@ -78,6 +81,11 @@ Fetches subscription links defined in `subscriptions.txt`, performs rapid pre-ch
 # Connect in Proxy-Only mode
 .\connect-subscription.ps1 -ProxyOnly
 ```
+
+#### Key Subscription Parameters
+- **`-Pause`**: By default, the subscription engine periodically checks and re-fetches the remote subscription (e.g. every 60 minutes) to hot-reload updated keys. Specifying `-Pause` fetches the subscription **only once** at startup, keeping the connection locked to those nodes without background polling.
+- **`-Url <string>`**: Connects to an ad-hoc subscription or Gist URL without editing `subscriptions.txt`.
+- **`-ProxyOnly`**: Runs mixed SOCKS5/HTTP proxy on `127.0.0.1:10808` without creating a virtual TUN adapter.
 
 #### Configuring Subscriptions
 Add your remote subscription links to `subscriptions.txt` (one per line):
@@ -108,12 +116,21 @@ Tests all candidate nodes across existing config files, filters out dead or bloc
 # Clean and consolidate all working nodes into config.json
 .\clean-configs.ps1
 
+# Clean and purge Google Cloud Platform (GCP) datacenter nodes
+.\clean-configs.ps1 -gcp
+
 # Dry run (test and display status without modifying files)
 .\clean-configs.ps1 -DryRun
 
 # Clean files in-place without merging
 .\clean-configs.ps1 -KeepSplit
 ```
+
+#### Key Cleaner Parameters
+- **`-gcp` / `-gpc` (or `-PurgeGcp`)**: Checks candidate nodes against known Google Cloud Platform CIDR ranges (`34.64.0.0/10`, `35.184.0.0/13`, `104.154.*`, `130.211.*`, etc.), reverse DNS `*.bc.googleusercontent.com`, and `gcp` tags. Purges all GCP datacenter nodes to safeguard Antigravity IDE and Google AI Studio from datacenter ASN blocks (`AS396982` / `AS15169`).
+- **`-DryRun`**: Previews alive, dead, and purged nodes without touching configuration files on disk.
+- **`-KeepSplit`**: Cleans and validates nodes inside individual config files without merging them into master `config.json`.
+- **`-TargetFile <name>`**: Targets a specific JSON file (e.g. `config02.json`).
 
 ### 5. Emergency Network Reset
 If a terminal is closed abruptly or a network glitch leaves lingering routing rules:

@@ -33,6 +33,9 @@
 
 .PARAMETER SystemProxy
     Set Windows system proxy to 127.0.0.1:MixedPort while running.
+
+.PARAMETER Pause
+    Fetches remote subscriptions once at startup, then pauses/disables recurring background interval fetching while connected.
 #>
 
 [CmdletBinding()]
@@ -47,6 +50,7 @@ param(
     [switch]$SystemProxy,
     [switch]$DisableFallbackPool,
     [switch]$DisableXrayBridge,
+    [switch]$Pause,
     [int]$MixedPort                    = 10808,
     [int]$DefaultUpdateIntervalMinutes = 60,
     [int]$CheckIntervalSeconds         = 30
@@ -100,6 +104,7 @@ if (-not $isAdmin -and -not $ProxyOnly) {
     if ($SystemProxy)      { $passArgs += "-SystemProxy" }
     if ($DisableFallbackPool) { $passArgs += "-DisableFallbackPool" }
     if ($DisableXrayBridge)   { $passArgs += "-DisableXrayBridge" }
+    if ($Pause)            { $passArgs += "-Pause" }
     if ($MixedPort)        { $passArgs += @("-MixedPort", "$MixedPort") }
 
     $argString = $passArgs -join " "
@@ -1589,7 +1594,11 @@ if (-not $ProxyOnly) {
 if ($vpnState.Active) {
     Write-Host ("  * Customer VPN       : FortiClient/Corporate traffic 100% ISOLATED & SAFE" ) -ForegroundColor Cyan
 }
-Write-Host "  * Auto-Update Loop   : ACTIVE (Monitors remote Gist for daily key updates)" -ForegroundColor Magenta
+if ($Pause) {
+    Write-Host "  * Auto-Update Loop   : PAUSED (-Pause enabled: single initial fetch, interval checks disabled)" -ForegroundColor Yellow
+} else {
+    Write-Host "  * Auto-Update Loop   : ACTIVE (Monitors remote Gist for daily key updates)" -ForegroundColor Magenta
+}
 Write-Host "  Press Ctrl+C to disconnect and restore network." -ForegroundColor DarkGray
 Write-Host "================================================================" -ForegroundColor Green
 Write-Host ""
@@ -1670,22 +1679,24 @@ try {
             }
         }
 
-        # 1. Check Subscriptions for Updates
-        foreach ($u in $targetUrls) {
-            $meta = $subTracker[$u]
-            $dueMinutes = if ($meta) { $meta.IntervalMin } else { $DefaultUpdateIntervalMinutes }
-            $lastTime   = if ($meta) { $meta.LastCheck } else { [DateTime]::MinValue }
+        # 1. Check Subscriptions for Updates (skipped if -Pause)
+        if (-not $Pause) {
+            foreach ($u in $targetUrls) {
+                $meta = $subTracker[$u]
+                $dueMinutes = if ($meta) { $meta.IntervalMin } else { $DefaultUpdateIntervalMinutes }
+                $lastTime   = if ($meta) { $meta.LastCheck } else { [DateTime]::MinValue }
 
-            if (($now - $lastTime).TotalMinutes -ge $dueMinutes) {
-                Write-Info ("Checking remote subscription update for: {0}..." -f $u)
-                if ($meta) { $meta.LastCheck = $now }
+                if (($now - $lastTime).TotalMinutes -ge $dueMinutes) {
+                    Write-Info ("Checking remote subscription update for: {0}..." -f $u)
+                    if ($meta) { $meta.LastCheck = $now }
 
-                $freshSub = Fetch-SubscriptionPayload -SubscriptionUrl $u
-                if ($freshSub -and $freshSub.Signature -ne $meta.Signature) {
-                    Write-Host ""
-                    Write-Warn ("Remote subscription updated! New content signature: {0}" -f $freshSub.Signature)
-                    $subTracker[$u].Signature = $freshSub.Signature
-                    $needsReload = $true
+                    $freshSub = Fetch-SubscriptionPayload -SubscriptionUrl $u
+                    if ($freshSub -and $freshSub.Signature -ne $meta.Signature) {
+                        Write-Host ""
+                        Write-Warn ("Remote subscription updated! New content signature: {0}" -f $freshSub.Signature)
+                        $subTracker[$u].Signature = $freshSub.Signature
+                        $needsReload = $true
+                    }
                 }
             }
         }
