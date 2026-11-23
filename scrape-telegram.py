@@ -14,6 +14,7 @@ import base64
 import asyncio
 import argparse
 import subprocess
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
@@ -114,21 +115,23 @@ class VpnExtractor:
 
     def parse_json_content(self, raw_text, source=""):
         found_any = False
-        m = re.search(r'(\{"app_version"[\s\S]*\}|\{[\s\S]*"config"[\s\S]*\})', raw_text)
+        m = re.search(r'(\{"metadata"[\s\S]*\}|\{"document"[\s\S]*\}|\{"app_version"[\s\S]*\}|\{[\s\S]*"config"[\s\S]*\})', raw_text)
         if not m:
             return False
 
         try:
             data = json.loads(m.group(1))
+
+            # 1. Format: { "config": [ ... ] } (HTTP Custom / SP-DECODE)
             configs = data.get("config", [])
             if isinstance(configs, dict):
                 configs = [configs]
 
             for idx, cfg in enumerate(configs, start=1):
                 raw_tag = cfg.get("name") or cfg.get("label") or f"node-{idx}"
-                clean_tag = re.sub(r'[^a-zA-Z0-9_\-\. ]', '', str(raw_tag))
+                clean_tag = re.sub(r'[^a-zA-Z0-9_\-\. ]', '', str(raw_tag)).strip() or f"Node-{idx}"
 
-                # 1. Standard SSH Protocol
+                # Standard SSH Protocol
                 host = cfg.get("host")
                 user = cfg.get("username")
                 port = cfg.get("port", 443)
@@ -146,7 +149,7 @@ class VpnExtractor:
                     if self.add_outbound(ob, source=source):
                         found_any = True
 
-                # 2. sshField format: "host:port@user:password" or "user:password@host:port"
+                # sshField format: "host:port@user:password" or "user:password@host:port"
                 ssh_field = cfg.get("sshField", "")
                 if ssh_field:
                     m1 = re.match(r"^([^:]+):(\d+)@([^:]+):(.*)$", ssh_field.strip())
@@ -173,8 +176,133 @@ class VpnExtractor:
                         }
                         if self.add_outbound(ob, source=source):
                             found_any = True
+
+            # 2. Format: { "document": { "configs": [ ... ] } } (Alain Bot Decrypt)
+            doc_configs = data.get("document", {}).get("configs", [])
+            for idx, cfg in enumerate(doc_configs, start=1):
+                raw_tag = cfg.get("name") or f"doc-node-{idx}"
+                clean_tag = re.sub(r'[^a-zA-Z0-9_\-\. ]', '', str(raw_tag)).strip() or f"Node-{idx}"
+                ssh_cfg = cfg.get("sshConfig", {})
+                h = ssh_cfg.get("sshHost") or cfg.get("address", "").split(":")[0]
+                p = ssh_cfg.get("sshPort") or 80
+                u = ssh_cfg.get("sshUsername")
+                pwd = ssh_cfg.get("sshPassword", "")
+                if h and u:
+                    ob = {
+                        "type": "ssh",
+                        "tag": f"SSH-{clean_tag}",
+                        "server": str(h).strip(),
+                        "server_port": int(p),
+                        "user": str(u).strip(),
+                        "password": str(pwd).strip()
+                    }
+                    if self.add_outbound(ob, source=source):
+                        found_any = True
         except Exception:
             pass
+        return found_any
+
+    def parse_bot_message_fields(self, raw_text, source=""):
+        found_any = False
+        norm = unicodedata.normalize('NFKD', raw_text)
+
+        # 1. Universal Decodez Bot [sshField] : host:port@user:pass
+        for m in re.finditer(r'\[sshField\]\s*:\s*[`"]?([^:`"\s]+):(\d+)@([^:`"\s]+):([^`"\s\n\r]+)[`"]?', norm, re.I):
+            host, port, user, pwd = m.group(1).strip(), int(m.group(2)), m.group(3).strip(), m.group(4).strip()
+            ob = {
+                "type": "ssh",
+                "tag": f"SSH-{host}",
+                "server": host,
+                "server_port": port,
+                "user": user,
+                "password": pwd
+            }
+            if self.add_outbound(ob, source=source):
+                found_any = True
+
+        for m in re.finditer(r'\[sshField\]\s*:\s*[`"]?([^:`"\s]+):([^@`"\s]+)@([^:`"\s]+):(\d+)[`"]?', norm, re.I):
+            user, pwd, host, port = m.group(1).strip(), m.group(2).strip(), m.group(3).strip(), int(m.group(4))
+            ob = {
+                "type": "ssh",
+                "tag": f"SSH-{host}",
+                "server": host,
+                "server_port": port,
+                "user": user,
+                "password": pwd
+            }
+            if self.add_outbound(ob, source=source):
+                found_any = True
+
+        # 2. Universal Decodez Bot field blocks: [host], [port], [user], [password]
+        host_m = re.search(r'\[host\]\s*:\s*[`"]?([^`"\s]+)[`"]?', norm, re.I)
+        port_m = re.search(r'\[port\]\s*:\s*[`"]?(\d+)[`"]?', norm, re.I)
+        user_m = re.search(r'\[user\]\s*:\s*[`"]?([^`"\s]+)[`"]?', norm, re.I)
+        pwd_m  = re.search(r'\[password\]\s*:\s*[`"]?([^`"\s]+)[`"]?', norm, re.I)
+        if host_m and user_m:
+            host = host_m.group(1).strip()
+            port = int(port_m.group(1)) if port_m else 443
+            user = user_m.group(1).strip()
+            pwd  = pwd_m.group(1).strip() if pwd_m else ""
+            ob = {
+                "type": "ssh",
+                "tag": f"SSH-{host}",
+                "server": host,
+                "server_port": port,
+                "user": user,
+                "password": pwd
+            }
+            if self.add_outbound(ob, source=source):
+                found_any = True
+
+        return found_any
+
+    def parse_vmess_links(self, raw_text, source=""):
+        found_any = False
+        for m in re.finditer(r"vmess://([A-Za-z0-9+/=_-]+)", raw_text):
+            b64 = m.group(1).replace("-", "+").replace("_", "/")
+            b64 += "=" * ((4 - len(b64) % 4) % 4)
+            try:
+                data = json.loads(base64.b64decode(b64).decode("utf-8", errors="ignore"))
+                raw_tag = data.get("ps") or f"VMESS-{data.get('add', 'node')}"
+                clean_tag = re.sub(r'[^a-zA-Z0-9_\-\. ]', '', str(raw_tag)).strip() or "VMESS-Node"
+                server = str(data.get("add", "")).strip()
+                port = int(data.get("port", 443))
+                uuid = str(data.get("id", "")).strip()
+                if not server or not uuid:
+                    continue
+
+                ob = {
+                    "type": "vmess",
+                    "tag": clean_tag,
+                    "server": server,
+                    "server_port": port,
+                    "uuid": uuid,
+                    "security": data.get("scy", "auto") or "auto",
+                    "alter_id": int(data.get("aid", 0))
+                }
+
+                tls_val = str(data.get("tls", "")).lower()
+                if tls_val == "tls":
+                    sni = data.get("sni") or data.get("host", "").split("\n")[0]
+                    ob["tls"] = {
+                        "enabled": True,
+                        "server_name": sni.strip() if sni else server
+                    }
+
+                net_val = str(data.get("net", "")).lower()
+                if net_val == "ws":
+                    ws = {"type": "ws"}
+                    if data.get("path"):
+                        ws["path"] = data.get("path")
+                    host_hdr = data.get("host")
+                    if host_hdr:
+                        ws["headers"] = {"Host": host_hdr.split("\n")[0].strip()}
+                    ob["transport"] = ws
+
+                if self.add_outbound(ob, source=source):
+                    found_any = True
+            except Exception:
+                pass
         return found_any
 
     def parse_share_links(self, raw_text, source=""):
@@ -263,9 +391,12 @@ class VpnExtractor:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
             fname = os.path.basename(file_path)
-            self.parse_dark_tunnel(content, source=fname)
-            self.parse_json_content(content, source=fname)
-            self.parse_share_links(content, source=fname)
+            norm_content = unicodedata.normalize('NFKD', content)
+            self.parse_dark_tunnel(norm_content, source=fname)
+            self.parse_json_content(norm_content, source=fname)
+            self.parse_bot_message_fields(norm_content, source=fname)
+            self.parse_vmess_links(norm_content, source=fname)
+            self.parse_share_links(norm_content, source=fname)
         except Exception as e:
             log_warn(f"Error reading file {file_path}: {e}")
 
@@ -449,13 +580,20 @@ async def scrape_telegram_group(client, target_channel, days, download_dir):
                 else:
                     downloaded_files.append(dest_path)
 
-        # Check for inline text payloads in message body
+        # Check for inline text payloads in message body (decrypted bot messages or share links)
         if msg.text:
-            if any(proto in msg.text for proto in ["darktunnel://", "vless://", "vmess://", "ss://", "sshField", '"config":']):
-                inline_file = os.path.join(download_dir, f"msg_{msg.id}_inline.txt")
+            norm_text = unicodedata.normalize('NFKD', msg.text)
+            is_decrypted = any(k in norm_text for k in [
+                "Universal Decodez Bot", "ALAIN BOT DECRYPT", "SP-DECODE",
+                "sshField", "[host]", "[port]", "[user]", "vmess://", "vless://",
+                "darktunnel://", "ss://", '"document":', '"config":'
+            ])
+            if is_decrypted:
+                inline_file = os.path.join(download_dir, f"msg_{msg.id}_decrypted.txt")
                 if not os.path.exists(inline_file):
+                    log_info(f"Saving decrypted message text [{msg.date.strftime('%Y-%m-%d %H:%M')}] -> 'msg_{msg.id}_decrypted.txt'")
                     with open(inline_file, "w", encoding="utf-8") as f:
-                        f.write(msg.text)
+                        f.write(norm_text)
                     downloaded_files.append(inline_file)
                     match_count += 1
 
