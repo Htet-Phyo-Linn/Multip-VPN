@@ -9,6 +9,7 @@ key.txt
 .env
 *.session
 *.session-journal
+telegram_qr_login.png
 
 # VPN Configurations (contains private keys/uuids)
 config*.json

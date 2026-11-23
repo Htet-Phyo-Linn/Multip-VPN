@@ -321,12 +321,80 @@ async def check_session_status(client):
         return False
 
 async def perform_telegram_login(client):
-    log_header("Telegram Interactive Login")
-    print("Please enter your Telegram credentials when prompted:")
-    await client.start()
-    me = await client.get_me()
-    log_ok(f"Successfully authenticated as: {me.first_name} (@{me.username or me.id})")
-    log_ok("Session saved to 'telegram_session.session' - future runs will use this session automatically!")
+    log_header("Telegram Authentication")
+    print("Choose login method:")
+    print("  [1] QR Code (Recommended - instant, no SMS/code required)")
+    print("  [2] Phone Number & Verification Code")
+    choice = input("\nEnter choice [1 or 2] (default: 1): ").strip()
+    if choice == "2":
+        await client.start()
+        me = await client.get_me()
+        log_ok(f"Successfully authenticated as: {me.first_name} (@{me.username or me.id})")
+        log_ok("Session saved to 'telegram_session.session'!")
+    else:
+        await perform_qr_login(client)
+
+async def perform_qr_login(client):
+    log_header("Telegram QR Code Login")
+    log_info("Connecting to Telegram and generating login QR code...")
+    try:
+        if not client.is_connected():
+            await client.connect()
+    except Exception as e:
+        log_err(f"Connection failed: {e}")
+        return False
+
+    qr_login = await client.qr_login()
+
+    import qrcode
+    qr = qrcode.QRCode()
+    qr.add_data(qr_login.url)
+    qr.print_ascii(invert=True)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    qr_img_path = os.path.join(script_dir, "telegram_qr_login.png")
+    try:
+        img = qrcode.make(qr_login.url)
+        img.save(qr_img_path)
+        log_info(f"Also saved QR image to: {qr_img_path}")
+    except Exception:
+        pass
+
+    print("\n" + "=" * 60)
+    print("  HOW TO LOG IN VIA QR CODE:")
+    print("  1. Open Telegram on your phone")
+    print("  2. Go to: Settings (⚙️) ➔ Devices ➔ Link Desktop Device")
+    print("  3. Point your camera at the QR code above")
+    print("     (Or open 'telegram_qr_login.png' from this folder)")
+    print("=" * 60 + "\n")
+    print("Waiting for scan (timeout: 120 seconds)...")
+
+    try:
+        user = await qr_login.wait(timeout=120)
+        log_ok(f"Successfully authenticated as: {user.first_name} (@{user.username or user.id})")
+        log_ok("Session saved to 'telegram_session.session' - future runs will use this session automatically!")
+        if os.path.exists(qr_img_path):
+            try: os.remove(qr_img_path)
+            except Exception: pass
+        return True
+    except asyncio.TimeoutError:
+        log_err("QR code timed out. Please run 'python scrape-telegram.py --qr' again.")
+        if os.path.exists(qr_img_path):
+            try: os.remove(qr_img_path)
+            except Exception: pass
+        return False
+    except Exception as e:
+        from telethon.errors import SessionPasswordNeededError
+        if isinstance(e, SessionPasswordNeededError):
+            pwd = input("Your account has Two-Step Verification (2FA). Enter password: ")
+            user = await client.sign_in(password=pwd)
+            log_ok(f"Successfully authenticated as: {user.first_name} (@{user.username or user.id})")
+            if os.path.exists(qr_img_path):
+                try: os.remove(qr_img_path)
+                except Exception: pass
+            return True
+        log_err(f"Login error: {e}")
+        return False
 
 async def scrape_telegram_group(client, target_channel, days, download_dir):
     os.makedirs(download_dir, exist_ok=True)
@@ -411,6 +479,7 @@ def main():
     parser.add_argument("-o", "--output", default="vpn_file_01.json", help="Output sing-box JSON file (default: vpn_file_01.json)")
     parser.add_argument("--target", default="decrypt_file_vpn", help="Telegram channel/group handle (default: decrypt_file_vpn)")
     parser.add_argument("--folder", default="vpn file", help="Local directory to store VPN files (default: 'vpn file')")
+    parser.add_argument("--qr", action="store_true", help="Log in instantly by scanning a QR code with your Telegram mobile app")
     parser.add_argument("--login", action="store_true", help="Start interactive login to create or refresh telegram session")
     parser.add_argument("--check-login", action="store_true", help="Check whether the Telegram login session is valid and exit")
     parser.add_argument("--extract-only", action="store_true", help="Extract existing files from folder without scraping Telegram")
@@ -446,6 +515,12 @@ def main():
     client = TelegramClient(session_name, API_ID, API_HASH)
 
     async def runner():
+        # Handle explicit QR code login
+        if args.qr:
+            await perform_qr_login(client)
+            await client.disconnect()
+            return
+
         # Handle explicit --login
         if args.login:
             await perform_telegram_login(client)
