@@ -105,7 +105,41 @@ function Extract-SubscriptionPayload([string]$raw) {
         if ($dec) { $trimmed = $dec.Trim() }
     }
 
-    # Case B: Sing-box JSON with outbounds
+    # Case B1: Outline / ssconf JSON payload (server, server_port, password, method)
+    if ($trimmed.StartsWith('{') -and $trimmed.Contains('"server"') -and $trimmed.Contains('"password"')) {
+        try {
+            $data = $trimmed | ConvertFrom-Json
+            if ($data.server -and $data.server_port -and $data.password) {
+                $method = if ($data.method) { $data.method } else { "chacha20-ietf-poly1305" }
+                $cred = "$($method):$($data.password)"
+                $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($cred))
+                $tagPart = if ($data.remarks) { "#$($data.remarks)" } else { "" }
+                $results.Add("ss://$b64@$($data.server):$($data.server_port)$tagPart")
+                return $results
+            }
+        } catch {}
+    }
+
+    # Case B2: SIP008 Shadowsocks multiple servers JSON
+    if ($trimmed.StartsWith('{') -and $trimmed.Contains('"servers"')) {
+        try {
+            $data = $trimmed | ConvertFrom-Json
+            if ($data.servers -and $data.servers.Count -gt 0) {
+                foreach ($s in $data.servers) {
+                    if ($s.server -and $s.server_port -and $s.password) {
+                        $method = if ($s.method) { $s.method } else { "chacha20-ietf-poly1305" }
+                        $cred = "$($method):$($s.password)"
+                        $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($cred))
+                        $tagPart = if ($s.remarks) { "#$($s.remarks)" } else { "" }
+                        $results.Add("ss://$b64@$($s.server):$($s.server_port)$tagPart")
+                    }
+                }
+                if ($results.Count -gt 0) { return $results }
+            }
+        } catch {}
+    }
+
+    # Case B3: Sing-box JSON with outbounds
     if ($trimmed.StartsWith('{') -and $trimmed.Contains('"outbounds"')) {
         try {
             $jsonObj = $trimmed | ConvertFrom-Json
@@ -161,12 +195,26 @@ function Get-KeyLines([string]$filePath) {
         }
     }
 
-    $urls = @($initialLines | Where-Object { $_ -match '^https?://' })
-    $directKeys = @($initialLines | Where-Object { $_ -notmatch '^https?://' })
+    function Resolve-SubscriptionTarget([string]$rawUri) {
+        $clean = $rawUri.Trim()
+        $tag = ""
+        if ($clean -match '^(.*?)#(.*)$') {
+            $clean = $Matches[1]
+            $tag = [System.Uri]::UnescapeDataString($Matches[2]).Trim()
+        }
+        if ($clean.StartsWith("ssconf://", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $clean = $clean.Substring(9)
+            if ($clean -notmatch '^https?://') { $clean = "https://$clean" }
+        }
+        return @{ Url = $clean; Tag = $tag }
+    }
+
+    $urls = @($initialLines | Where-Object { $_ -match '^https?://' -or $_ -match '^ssconf://' })
+    $directKeys = @($initialLines | Where-Object { $_ -notmatch '^https?://' -and $_ -notmatch '^ssconf://' })
 
     $collectedLines = [System.Collections.Generic.List[string]]::new()
 
-    # Process HTTP/HTTPS Subscription URLs
+    # Process HTTP/HTTPS / ssconf Subscription URLs
     if ($urls.Count -gt 0) {
         Write-Host ("[*] Detected {0} subscription URL(s) in {1}. Fetching..." -f $urls.Count, (Split-Path $filePath -Leaf)) -ForegroundColor Cyan
         
@@ -184,10 +232,13 @@ function Get-KeyLines([string]$filePath) {
             $httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("v2rayN/6.23")
             $httpClient.Timeout = [TimeSpan]::FromSeconds(8)
 
+            $uTargets = @{}
             $tasks = @{}
             foreach ($u in $urls) {
+                $target = Resolve-SubscriptionTarget $u
+                $uTargets[$u] = $target
                 try {
-                    $tasks[$u] = $httpClient.GetStringAsync($u)
+                    $tasks[$u] = $httpClient.GetStringAsync($target.Url)
                 } catch {}
             }
 
@@ -198,16 +249,23 @@ function Get-KeyLines([string]$filePath) {
             $uIdx = 0
             foreach ($u in $urls) {
                 $uIdx++
+                $target = $uTargets[$u]
                 if ($tasks.ContainsKey($u) -and $tasks[$u].Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion) {
                     $payload = $tasks[$u].Result.Trim()
                     $subExtracted = Extract-SubscriptionPayload $payload
-                    foreach ($k in $subExtracted) { $collectedLines.Add($k) }
+                    foreach ($k in $subExtracted) {
+                        $finalKey = if ($target.Tag -and $k -notmatch '#') { "$k#$($target.Tag)" } else { $k }
+                        $collectedLines.Add($finalKey)
+                    }
                     Write-Host ("  [{0}/{1}] Fetched {2} node(s) from: {3}" -f $uIdx, $urls.Count, $subExtracted.Count, $u) -ForegroundColor Green
                 } else {
-                    $curlResp = curl.exe -s -L --max-time 6 -A "v2rayN/6.23" $u
+                    $curlResp = curl.exe -s -L --max-time 6 -A "v2rayN/6.23" $target.Url
                     if ($curlResp) {
                         $subExtracted = Extract-SubscriptionPayload $curlResp.Trim()
-                        foreach ($k in $subExtracted) { $collectedLines.Add($k) }
+                        foreach ($k in $subExtracted) {
+                            $finalKey = if ($target.Tag -and $k -notmatch '#') { "$k#$($target.Tag)" } else { $k }
+                            $collectedLines.Add($finalKey)
+                        }
                         Write-Host ("  [{0}/{1}] Fetched {2} node(s) (curl fallback) from: {3}" -f $uIdx, $urls.Count, $subExtracted.Count, $u) -ForegroundColor Green
                     } else {
                         Write-Host ("  [{0}/{1}] WARNING: Failed to fetch: {2}" -f $uIdx, $urls.Count, $u) -ForegroundColor Yellow
@@ -219,10 +277,14 @@ function Get-KeyLines([string]$filePath) {
             $uIdx = 0
             foreach ($u in $urls) {
                 $uIdx++
-                $curlResp = curl.exe -s -L --max-time 6 -A "v2rayN/6.23" $u
+                $target = Resolve-SubscriptionTarget $u
+                $curlResp = curl.exe -s -L --max-time 6 -A "v2rayN/6.23" $target.Url
                 if ($curlResp) {
                     $subExtracted = Extract-SubscriptionPayload $curlResp.Trim()
-                    foreach ($k in $subExtracted) { $collectedLines.Add($k) }
+                    foreach ($k in $subExtracted) {
+                        $finalKey = if ($target.Tag -and $k -notmatch '#') { "$k#$($target.Tag)" } else { $k }
+                        $collectedLines.Add($finalKey)
+                    }
                     Write-Host ("  [{0}/{1}] Fetched {2} node(s) from: {3}" -f $uIdx, $urls.Count, $subExtracted.Count, $u) -ForegroundColor Green
                 } else {
                     Write-Host ("  [{0}/{1}] WARNING: Failed to fetch: {2}" -f $uIdx, $urls.Count, $u) -ForegroundColor Yellow
@@ -307,6 +369,76 @@ function Parse-Shadowsocks([string]$uri, [string]$tag) {
 
         return $node
     }
+    return $null
+}
+
+function Parse-Ssconf([string]$uri, [string]$tag) {
+    if (-not $uri.StartsWith("ssconf://", [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $null
+    }
+    $body = $uri.Substring(9) # strip 'ssconf://'
+    $urlTag = ""
+    if ($body -match '^(.*?)#(.*)$') {
+        $body = $Matches[1]
+        $urlTag = [System.Uri]::UnescapeDataString($Matches[2]).Trim()
+    }
+    if (-not $tag -and $urlTag) { $tag = $urlTag }
+
+    $fetchUrl = if ($body -match '^https?://') { $body } else { "https://$body" }
+    
+    $rawJson = ""
+    try {
+        $rawJson = (curl.exe -s -L --max-time 8 -A "v2rayN/6.23" $fetchUrl) -join "`n"
+        $rawJson = $rawJson.Trim()
+    } catch {
+        return $null
+    }
+
+    if (-not $rawJson) { return $null }
+
+    if ($rawJson.StartsWith("ss://", [System.StringComparison]::OrdinalIgnoreCase)) {
+        return Parse-Shadowsocks $rawJson $tag
+    }
+
+    try {
+        $data = $rawJson | ConvertFrom-Json
+        if ($data.server -and $data.server_port -and $data.password) {
+            $method = if ($data.method) { Normalize-ShadowsocksMethod $data.method } else { "chacha20-ietf-poly1305" }
+            $srv = $data.server.ToString().Trim('[', ']')
+            $prt = [int]$data.server_port
+            $nodeTag = if ($tag) { $tag } elseif ($data.remarks) { $data.remarks } else { "SS-$srv`:$prt" }
+            $node = [ordered]@{
+                type        = "shadowsocks"
+                tag         = $nodeTag
+                server      = $srv
+                server_port = $prt
+                method      = $method
+                password    = $data.password.ToString().Trim()
+            }
+            if ($data.prefix) {
+                $node["prefix"] = $data.prefix
+            }
+            return $node
+        }
+        if ($data.servers -and $data.servers.Count -gt 0) {
+            $s = $data.servers[0]
+            if ($s.server -and $s.server_port -and $s.password) {
+                $m = if ($s.method) { Normalize-ShadowsocksMethod $s.method } else { "chacha20-ietf-poly1305" }
+                $srv = $s.server.ToString().Trim('[', ']')
+                $prt = [int]$s.server_port
+                $sTag = if ($s.remarks) { $s.remarks } elseif ($tag) { $tag } else { "SS-$srv`:$prt" }
+                return [ordered]@{
+                    type        = "shadowsocks"
+                    tag         = $sTag
+                    server      = $srv
+                    server_port = $prt
+                    method      = $m
+                    password    = $s.password.ToString().Trim()
+                }
+            }
+        }
+    } catch {}
+
     return $null
 }
 
@@ -629,6 +761,8 @@ foreach ($line in $keyLines) {
     $node = $null
     if ($rawUri.StartsWith("ss://", [System.StringComparison]::OrdinalIgnoreCase)) {
         $node = Parse-Shadowsocks $rawUri $tag
+    } elseif ($rawUri.StartsWith("ssconf://", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $node = Parse-Ssconf $rawUri $tag
     } elseif ($rawUri.StartsWith("vless://", [System.StringComparison]::OrdinalIgnoreCase)) {
         $node = Parse-Vless $rawUri $tag
     } elseif ($rawUri.StartsWith("vmess://", [System.StringComparison]::OrdinalIgnoreCase)) {

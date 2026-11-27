@@ -949,6 +949,10 @@ function Fetch-SubscriptionPayload {
         $cleanUrl = $Matches[1]
         $urlTag = [System.Uri]::UnescapeDataString($Matches[2]).Trim()
     }
+    if ($cleanUrl.StartsWith("ssconf://", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $cleanUrl = $cleanUrl.Substring(9)
+        if ($cleanUrl -notmatch '^https?://') { $cleanUrl = "https://$cleanUrl" }
+    }
     $rawText = ""
 
     try {
@@ -973,7 +977,41 @@ function Fetch-SubscriptionPayload {
     $signature = [System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
 
     $decodedText = $rawText
-    if ($rawText -notmatch '://' -and $rawText.Length -gt 25) {
+    # Check for Outline / ssconf JSON payload
+    if ($rawText.StartsWith('{') -and $rawText.Contains('"server"') -and $rawText.Contains('"password"')) {
+        try {
+            $data = $rawText | ConvertFrom-Json
+            if ($data.server -and $data.server_port -and $data.password) {
+                $method = if ($data.method) { $data.method } else { "chacha20-ietf-poly1305" }
+                $cred = "$($method):$($data.password)"
+                $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($cred))
+                $tagPart = if ($urlTag) { "#$urlTag" } elseif ($data.remarks) { "#$($data.remarks)" } else { "" }
+                $decodedText = "ss://$b64@$($data.server):$($data.server_port)$tagPart"
+            }
+        } catch {}
+    } elseif ($rawText.StartsWith('{') -and $rawText.Contains('"servers"')) {
+        try {
+            $data = $rawText | ConvertFrom-Json
+            if ($data.servers -and $data.servers.Count -gt 0) {
+                $linesList = [System.Collections.Generic.List[string]]::new()
+                $subIdx = 0
+                foreach ($s in $data.servers) {
+                    $subIdx++
+                    if ($s.server -and $s.server_port -and $s.password) {
+                        $method = if ($s.method) { $s.method } else { "chacha20-ietf-poly1305" }
+                        $cred = "$($method):$($s.password)"
+                        $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($cred))
+                        $sTag = if ($s.remarks) { $s.remarks } elseif ($urlTag) { if ($data.servers.Count -gt 1) { "$urlTag-$subIdx" } else { $urlTag } } else { "" }
+                        $tagPart = if ($sTag) { "#$sTag" } else { "" }
+                        $linesList.Add("ss://$b64@$($s.server):$($s.server_port)$tagPart")
+                    }
+                }
+                if ($linesList.Count -gt 0) {
+                    $decodedText = $linesList -join "`n"
+                }
+            }
+        } catch {}
+    } elseif ($rawText -notmatch '://' -and $rawText.Length -gt 25) {
         $dec = Decode-Base64 $rawText
         if ($dec) { $decodedText = $dec }
     }

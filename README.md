@@ -98,7 +98,7 @@ https://my-substore.com/download/clash
 ```
 
 ### 3. Converting Raw VPN Keys
-Paste your share links (`ss://`, `vless://`, `vmess://`, `trojan://`, `hysteria2://`, `tuic://`) into `key.txt` and convert them:
+Paste your share links (`ss://`, `ssconf://` (Outline SIP008 dynamic keys), `vless://`, `vmess://`, `trojan://`, `hysteria2://`, `tuic://`) into `key.txt` and convert them:
 
 ```powershell
 # Bundle all live keys into a single config (e.g. config02.json)
