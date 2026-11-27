@@ -22,6 +22,7 @@ vpn file/
 _singbox*.json
 _geo_cache.json
 _probe*.json
+_cluster_routes.txt
 *.tmp
 *.log
 
