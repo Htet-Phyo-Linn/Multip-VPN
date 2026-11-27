@@ -1,0 +1,49 @@
+{
+  "project": "Multip VPN Cross-Platform Client",
+  "version": "1.0.0-draft",
+  "branch": "feat/cross-platform-app",
+  "framework_recommendation": "Tauri v2 (Rust Core + React 19 / TypeScript / Tailwind CSS)",
+  "milestones": [
+    {
+      "id": "M1",
+      "name": "Phase 1: Architecture, Daemon IPC & Sidecar Contracts",
+      "status": "in_progress",
+      "tasks": [
+        "ARCH-01: Establish Architectural Decision Record (ADR) comparing Tauri v2, Electron, and Wails",
+        "ARCH-02: Define JSON-RPC / IPC schemas for Daemon Sidecar management",
+        "ARCH-03: Implement Process Supervisor contract with NASA JPL bounded loops"
+      ]
+    },
+    {
+      "id": "M2",
+      "name": "Phase 2: Windows System Integration & Privileged Networking",
+      "status": "pending",
+      "tasks": [
+        "SYS-01: Windows UAC Elevation Helper & Wintun adapter lifecycle",
+        "SYS-02: Split-Tunneling & Corporate VPN bypass detector (RFC 1918 + FortiClient / AnyConnect)",
+        "SYS-03: System Tray integration with connection status badges & quick switch"
+      ]
+    },
+    {
+      "id": "M3",
+      "name": "Phase 3: GUI Frontend & State Management",
+      "status": "pending",
+      "tasks": [
+        "GUI-01: Dashboard with real-time Traffic Graph (Upload / Download speeds) & Active Node info",
+        "GUI-02: Node Matrix with 16-thread live latency prober & one-click prune",
+        "GUI-03: Subscription Manager with auto-reload, -Pause toggle, and QR-code Telegram scraper UI",
+        "GUI-04: Antigravity-Safe & Streaming Pool policy toggles"
+      ]
+    },
+    {
+      "id": "M4",
+      "name": "Phase 4: Packaging, Cross-Platform Builds & CI/CD",
+      "status": "pending",
+      "tasks": [
+        "PKG-01: Bundle sing-box.exe and xray.exe as sidecar binaries",
+        "PKG-02: Build Windows NSIS / MSI standalone installer and portable ZIP",
+        "PKG-03: Linux AppImage & macOS DMG portability verification"
+      ]
+    }
+  ]
+}

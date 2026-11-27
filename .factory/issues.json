@@ -1,0 +1,44 @@
+{
+  "issues": [
+    {
+      "id": "FEAT-001",
+      "title": "Evaluate & Select GUI Desktop Framework (Tauri v2 vs Electron vs Wails)",
+      "type": "architecture",
+      "priority": "P0",
+      "status": "open",
+      "description": "Produce an Architectural Decision Record comparing binary footprint, memory consumption, UAC elevation for TUN mode, and cross-platform readiness."
+    },
+    {
+      "id": "FEAT-002",
+      "title": "Sidecar Process Manager & Watchdog Engine",
+      "type": "core",
+      "priority": "P0",
+      "status": "open",
+      "description": "Build process supervisor to launch, monitor, health-check, and cleanly terminate sing-box.exe and xray.exe adhering to NASA JPL bounded loops and deterministic teardown."
+    },
+    {
+      "id": "FEAT-003",
+      "title": "Clash / Sing-Box REST API Client Integration",
+      "type": "network",
+      "priority": "P1",
+      "status": "open",
+      "description": "Connect to sing-box internal controller (Clash API on 127.0.0.1:9090) for live node switching, real-time latency tests, and connection tracking."
+    },
+    {
+      "id": "FEAT-004",
+      "title": "Configuration & Key Conversion Engine",
+      "type": "converter",
+      "priority": "P1",
+      "status": "open",
+      "description": "Port existing PowerShell conversion logic (convert-keys.ps1, scrape-telegram.py, clean-configs.ps1) into cross-platform TypeScript/Rust backend modules."
+    },
+    {
+      "id": "FEAT-005",
+      "title": "Modern Windows Desktop GUI with System Tray",
+      "type": "frontend",
+      "priority": "P1",
+      "status": "open",
+      "description": "Build high-performance React/Tailwind GUI featuring dark theme, live latency badges, policy switches, and minimize-to-tray."
+    }
+  ]
+}
