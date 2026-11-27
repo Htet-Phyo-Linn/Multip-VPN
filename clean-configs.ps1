@@ -179,7 +179,9 @@ function Test-IsGcpNode {
             $combinedGeo -match "google llc" -or 
             $combinedGeo -match "as396982" -or 
             $combinedGeo -match "as15169" -or 
-            $combinedGeo -match "googleusercontent") {
+            $combinedGeo -match "googleusercontent" -or
+            $combinedGeo -match "atlantic" -or
+            $combinedGeo -match "as6364") {
             return $true
         }
     }
@@ -189,7 +191,8 @@ function Test-IsGcpNode {
         $srvLower = $Server.ToLowerInvariant()
         if ($srvLower -like "*.bc.googleusercontent.com" -or 
             $srvLower -like "*gcp*" -or 
-            $srvLower -like "*googlecloud*") {
+            $srvLower -like "*googlecloud*" -or
+            $srvLower -like "*atlantic*") {
             return $true
         }
     }
@@ -197,7 +200,7 @@ function Test-IsGcpNode {
     # 4. Check Tag
     if ($Tag) {
         $tagLower = $Tag.ToLowerInvariant()
-        if ($tagLower -match '\bgcp\b' -or $tagLower -match 'google cloud') {
+        if ($tagLower -match '\bgcp\b' -or $tagLower -match 'google cloud' -or $tagLower -match 'atlantic') {
             return $true
         }
     }

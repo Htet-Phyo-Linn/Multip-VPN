@@ -884,8 +884,30 @@ foreach ($srv in $uniqueServers) {
     $countryCode = if ($geo -and $geo.country) { $geo.country } else { "UNKNOWN" }
     $city = if ($geo -and $geo.city) { " ($($geo.city))" } else { "" }
 
+    # Check for Datacenter ASNs incompatible with Antigravity / Gemini (Atlantic.Net AS6364, GCP AS396982/AS15169)
+    $isBlockedOrg = $false
+    $blockReason = ""
+    if ($geo) {
+        $combinedGeo = ("{0} {1} {2}" -f $geo.isp, $geo.org, $geo.as).ToLowerInvariant()
+        if ($combinedGeo -match "atlantic" -or $combinedGeo -match "as6364") {
+            $isBlockedOrg = $true
+            $blockReason = "Atlantic.Net datacenter flagged by Antigravity"
+        } elseif ($combinedGeo -match "google cloud" -or $combinedGeo -match "as396982" -or $combinedGeo -match "as15169") {
+            $isBlockedOrg = $true
+            $blockReason = "Google Cloud Platform datacenter blocked by Antigravity"
+        }
+    }
+    if ($srv.ToLowerInvariant() -match "atlantic") {
+        $isBlockedOrg = $true
+        $blockReason = "Atlantic node flagged by Antigravity"
+    }
+
     if ($BlockedCountries -contains $countryCode) {
-        Write-Host "  [-] BLOCKED: $srv [$countryCode]$city -> Excluded (Antigravity unsupported)" -ForegroundColor Red
+        Write-Host "  [-] BLOCKED: $srv [$countryCode]$city -> Excluded (Antigravity unsupported region)" -ForegroundColor Red
+        $serverStatusMap[$srv] = $false
+        $blockedCount++
+    } elseif ($isBlockedOrg) {
+        Write-Host "  [-] BLOCKED: $srv [$countryCode]$city -> Excluded ($blockReason)" -ForegroundColor Yellow
         $serverStatusMap[$srv] = $false
         $blockedCount++
     } else {
